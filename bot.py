@@ -17,21 +17,22 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 print("🚀 Запуск P2P мониторинга Bybit...")
 print("="*60)
 
-# --- 2. Функция для подписанного запроса к Bybit ---
+# --- 2. Функция для подписанного запроса к Bybit (ПРАВИЛЬНАЯ) ---
 
 def bybit_signed_request(endpoint, params):
-    """Выполняет подписанный запрос к API Bybit"""
+    """Выполняет подписанный запрос к API Bybit согласно документации"""
     
     base_url = "https://api.bybit.com"
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
     
-    # Сортировка параметров для подписи
-    sorted_params = sorted(params.items())
-    query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
+    # Для POST запросов подписываем JSON тело
+    json_body = json.dumps(params, separators=(',', ':'))
     
-    # Создание подписи
-    sign_str = timestamp + BYBIT_API_KEY + recv_window + query_string
+    # Строка для подписи: timestamp + API key + recv_window + jsonBodyString
+    sign_str = timestamp + BYBIT_API_KEY + recv_window + json_body
+    
+    # Создание подписи HMAC-SHA256
     signature = hmac.new(
         bytes(BYBIT_API_SECRET, "utf-8"),
         bytes(sign_str, "utf-8"),
@@ -48,6 +49,8 @@ def bybit_signed_request(endpoint, params):
     }
     
     url = base_url + endpoint
+    
+    print(f"🔑 Подпись создана для запроса к {endpoint}")
     
     try:
         response = requests.post(url, json=params, headers=headers, timeout=10)
@@ -67,22 +70,25 @@ def get_p2p_orders(side, coin="USDT", fiat="RUB", limit=5):
         "currencyId": "RUB",
         "side": side,  # "BUY" или "SELL"
         "page": "1",
-        "size": str(limit),
-        "sortType": "1"  # Сортировка по цене
+        "size": str(limit)
     }
     
     print(f"📡 Запрос {side} объявлений...")
     
     response = bybit_signed_request("/v5/p2p/item/online", params)
     
-    if response and response.get("retCode") == 0:
-        items = response.get("result", {}).get("items", [])
-        print(f"   ✅ Получено {len(items)} объявлений")
-        return items
-    else:
-        if response:
+    if response:
+        print(f"   Ответ: retCode={response.get('retCode')}, retMsg={response.get('retMsg')}")
+        
+        if response.get("retCode") == 0:
+            items = response.get("result", {}).get("items", [])
+            print(f"   ✅ Получено {len(items)} объявлений")
+            return items
+        else:
             print(f"   ❌ Ошибка: {response.get('retMsg', 'Неизвестная ошибка')}")
-            print(f"   Код: {response.get('retCode')}")
+            return []
+    else:
+        print("   ❌ Нет ответа от API")
         return []
 
 # --- 4. Получаем объявления ---
@@ -122,7 +128,7 @@ if buy_orders and sell_orders:
         buy_avg = (buy_min + buy_max) / 2 if buy_min and buy_max else buy_min
         
         # Количество USDT
-        if buy_price != "N/A":
+        if buy_price != "N/A" and float(buy_price) > 0:
             usdt_amount = buy_avg / float(buy_price)
         else:
             usdt_amount = 0
@@ -140,13 +146,35 @@ elif buy_orders:
     print("\n⚠️ Получены только BUY объявления, SELL не найдены")
     print(f"   BUY: {len(buy_orders)} объявлений")
     
+    # Покажем что есть
+    print("\n📋 BUY объявления:")
+    for i, buy in enumerate(buy_orders[:5], 1):
+        price = buy.get("price", "N/A")
+        seller = buy.get("advertiser", {}).get("nickName", "N/A")
+        print(f"   {i}. {price} RUB y {seller}")
+    
 elif sell_orders:
     print("\n⚠️ Получены только SELL объявления, BUY не найдены")
     print(f"   SELL: {len(sell_orders)} объявлений")
     
+    print("\n📋 SELL объявления:")
+    for i, sell in enumerate(sell_orders[:5], 1):
+        price = sell.get("price", "N/A")
+        seller = sell.get("advertiser", {}).get("nickName", "N/A")
+        print(f"   {i}. {price} RUB y {seller}")
+    
 else:
     print("\n❌ НЕ УДАЛОСЬ ПОЛУЧИТЬ ДАННЫЕ ОТ BYBIT")
-    print("\n🔍 Возможные причины:")
-    print("   1. Нет активных объявлений в паре USDT/RUB")
-    print("   2. API ключи не имеют прав на P2P запросы")
-    print("   3. Проблемы с сетью или API Bybit")
+    
+    # Попробуем проверить статус API
+    print("\n🔍 Проверка статуса API...")
+    try:
+        time_response = requests.get("https://api.bybit.com/v5/market/time")
+        if time_response.status_code == 200:
+            time_data = time_response.json()
+            print(f"   ✅ Сервер Bybit доступен")
+            print(f"   Время сервера: {time_data.get('result', {}).get('timeSecond')}")
+        else:
+            print(f"   ❌ Ошибка доступа к серверу: {time_response.status_code}")
+    except Exception as e:
+        print(f"   ❌ Ошибка: {e}")
