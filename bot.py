@@ -162,6 +162,14 @@ if buy_orders and sell_orders:
         buy_seller = buy.get("nickName", buy.get("nickname", "N/A"))
         sell_seller = sell.get("nickName", sell.get("nickname", "N/A"))
         
+        # Получаем userMaskId для ссылок
+        buy_user_mask_id = buy.get("userMaskId", "")
+        sell_user_mask_id = sell.get("userMaskId", "")
+        
+        # Формируем ссылки на профили
+        buy_profile_link = f"https://www.bybit.com/ru-RU/p2p/profile/{buy_user_mask_id}/USDT/RUB/item" if buy_user_mask_id else "Ссылка недоступна"
+        sell_profile_link = f"https://www.bybit.com/ru-RU/p2p/profile/{sell_user_mask_id}/USDT/RUB/item" if sell_user_mask_id else "Ссылка недоступна"
+        
         # Сумма и USDT
         buy_min = Decimal(str(buy.get("minAmount", 0)))
         buy_max = Decimal(str(buy.get("maxAmount", 0)))
@@ -189,6 +197,10 @@ if buy_orders and sell_orders:
         print(f"   SELL: {fmt(sell_price)} RUB y {sell_seller}")
         print(f"   Сумма: {fmt(trade_amount)} RUB (~{fmt(usdt_amount)} USDT)")
         
+        # Ссылки на профили
+        print(f"   🔗 BUY профиль: {buy_profile_link}")
+        print(f"   🔗 SELL профиль: {sell_profile_link}")
+        
         # Дополнительная информация из объявлений
         buy_methods = buy.get("paymentMethods", [])
         if buy_methods:
@@ -208,7 +220,10 @@ elif buy_orders:
     for i, buy in enumerate(buy_orders[:5], 1):
         price = buy.get("price", "N/A")
         seller = buy.get("nickName", "N/A")
+        user_mask_id = buy.get("userMaskId", "")
+        profile_link = f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item" if user_mask_id else "Ссылка недоступна"
         print(f"   {i}. {price} RUB y {seller}")
+        print(f"      🔗 {profile_link}")
     
 elif sell_orders:
     print("⚠️ Получены только SELL объявления")
@@ -218,7 +233,10 @@ elif sell_orders:
     for i, sell in enumerate(sell_orders[:5], 1):
         price = sell.get("price", "N/A")
         seller = sell.get("nickName", "N/A")
+        user_mask_id = sell.get("userMaskId", "")
+        profile_link = f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item" if user_mask_id else "Ссылка недоступна"
         print(f"   {i}. {price} RUB y {seller}")
+        print(f"      🔗 {profile_link}")
     
 else:
     print("❌ НЕ УДАЛОСЬ ПОЛУЧИТЬ ДАННЫЕ ОТ BYBIT")
@@ -227,7 +245,7 @@ else:
     print("   2. API ключи не имеют прав на P2P запросы")
     print("   3. Проблемы с сетью или API Bybit")
 
-# --- 7. ДЕТАЛЬНЫЙ ВЫВОД ВСЕЙ ИНФОРМАЦИИ ПО МЕЙКЕРАМ ---
+# --- 7. ДЕТАЛЬНЫЙ ВЫВОД ВСЕЙ ИНФОРМАЦИИ ПО МЕЙКЕРАМ (включая ссылки) ---
 
 print("\n" + "="*80)
 print("🔍 ПОДРОБНАЯ ИНФОРМАЦИЯ ПО ВСЕМ МЕЙКЕРАМ (MAKERS)")
@@ -253,8 +271,17 @@ if buy_orders:
         # Основная информация
         print(f"   👤 Nickname: {safe_get(order, 'nickName', default='N/A')}")
         print(f"   🆔 UID: {safe_get(order, 'uid', default='N/A')}")
+        print(f"   🆔 User Mask ID: {safe_get(order, 'userMaskId', default='N/A')}")
         print(f"   🔑 User ID: {safe_get(order, 'userId', default='N/A')}")
         print(f"   📧 Email: {safe_get(order, 'email', default='N/A')}")
+        
+        # Ссылка на профиль
+        user_mask_id = order.get("userMaskId", "")
+        if user_mask_id:
+            profile_link = f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item"
+            print(f"   🔗 Ссылка на профиль: {profile_link}")
+        else:
+            print(f"   🔗 Ссылка на профиль: Недоступна")
         
         # Цены и суммы
         print(f"   💰 Цена: {safe_get(order, 'price', default='N/A')} RUB")
@@ -282,8 +309,6 @@ if buy_orders:
         print(f"   📱 Телефон: {safe_get(order, 'phone', default='N/A')}")
         print(f"   🏢 Регистрация: {safe_get(order, 'registerTime', default='N/A')}")
         
-        # Полный JSON для отладки
-        print(f"   📄 Полные данные: {json.dumps(order, ensure_ascii=False, indent=4)}")
         print("   " + "-"*76)
 
 # Вывод SELL объявлений
@@ -297,8 +322,17 @@ if sell_orders:
         # Основная информация
         print(f"   👤 Nickname: {safe_get(order, 'nickName', default='N/A')}")
         print(f"   🆔 UID: {safe_get(order, 'uid', default='N/A')}")
+        print(f"   🆔 User Mask ID: {safe_get(order, 'userMaskId', default='N/A')}")
         print(f"   🔑 User ID: {safe_get(order, 'userId', default='N/A')}")
         print(f"   📧 Email: {safe_get(order, 'email', default='N/A')}")
+        
+        # Ссылка на профиль
+        user_mask_id = order.get("userMaskId", "")
+        if user_mask_id:
+            profile_link = f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item"
+            print(f"   🔗 Ссылка на профиль: {profile_link}")
+        else:
+            print(f"   🔗 Ссылка на профиль: Недоступна")
         
         # Цены и суммы
         print(f"   💰 Цена: {safe_get(order, 'price', default='N/A')} RUB")
@@ -326,11 +360,9 @@ if sell_orders:
         print(f"   📱 Телефон: {safe_get(order, 'phone', default='N/A')}")
         print(f"   🏢 Регистрация: {safe_get(order, 'registerTime', default='N/A')}")
         
-        # Полный JSON для отладки
-        print(f"   📄 Полные данные: {json.dumps(order, ensure_ascii=False, indent=4)}")
         print("   " + "-"*76)
 
-# Сводка по всем мейкерам
+# Сводка по всем мейкерам с ссылками
 print("\n" + "="*80)
 print("📊 СВОДКА ПО ВСЕМ МЕЙКЕРАМ")
 print("="*80)
@@ -338,31 +370,48 @@ print("="*80)
 all_makers = []
 if buy_orders:
     for order in buy_orders:
+        user_mask_id = order.get("userMaskId", "")
+        profile_link = f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item" if user_mask_id else "Нет ссылки"
         all_makers.append({
             'type': 'BUY',
             'nickname': safe_get(order, 'nickName'),
             'uid': safe_get(order, 'uid'),
+            'user_mask_id': user_mask_id,
+            'profile_link': profile_link,
             'price': safe_get(order, 'price'),
             'rating': safe_get(order, 'rating'),
             'trades': safe_get(order, 'tradeCount')
         })
 if sell_orders:
     for order in sell_orders:
+        user_mask_id = order.get("userMaskId", "")
+        profile_link = f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item" if user_mask_id else "Нет ссылки"
         all_makers.append({
             'type': 'SELL',
             'nickname': safe_get(order, 'nickName'),
             'uid': safe_get(order, 'uid'),
+            'user_mask_id': user_mask_id,
+            'profile_link': profile_link,
             'price': safe_get(order, 'price'),
             'rating': safe_get(order, 'rating'),
             'trades': safe_get(order, 'tradeCount')
         })
 
 if all_makers:
-    print(f"\n{'Тип':<6} {'Никнейм':<20} {'UID':<15} {'Цена RUB':<12} {'Рейтинг':<8} {'Сделок':<8}")
-    print("-"*80)
+    print(f"\n{'Тип':<6} {'Никнейм':<20} {'UID':<15} {'User Mask ID':<36} {'Цена RUB':<12} {'Рейтинг':<8} {'Сделок':<8}")
+    print("-"*120)
     for maker in all_makers:
         print(f"{maker['type']:<6} {maker['nickname']:<20} {maker['uid']:<15} "
-              f"{maker['price']:<12} {maker['rating']:<8} {maker['trades']:<8}")
+              f"{maker['user_mask_id']:<36} {maker['price']:<12} {maker['rating']:<8} {maker['trades']:<8}")
+    
+    print("\n" + "="*80)
+    print("🔗 ССЫЛКИ НА ПРОФИЛИ ВСЕХ МЕЙКЕРОВ:")
+    print("="*80)
+    for idx, maker in enumerate(all_makers, 1):
+        print(f"{idx}. [{maker['type']}] {maker['nickname']} (UID: {maker['uid']})")
+        print(f"   🔗 {maker['profile_link']}")
+        print()
+    
     print(f"\n📌 Всего мейкеров: {len(all_makers)}")
     print(f"   BUY мейкеров: {len(buy_orders) if buy_orders else 0}")
     print(f"   SELL мейкеров: {len(sell_orders) if sell_orders else 0}")
