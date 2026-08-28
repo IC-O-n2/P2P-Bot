@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime
 import requests
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.types import ParseMode
-from aiogram.utils import executor
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import Message, ParseMode
+from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения
@@ -327,15 +327,14 @@ class P2PArbitrageBot:
 
 
 # Инициализация бота
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 arbitrage_bot = P2PArbitrageBot(bot)
 
 # --- Обработчики команд ---
 
-@dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
     """Команда /start"""
     welcome_text = """
 🚀 <b>Добро пожаловать в P2P Арбитраж Бот!</b>
@@ -357,14 +356,14 @@ async def cmd_start(message: types.Message):
 3. Бот будет искать выгодные связки
 4. При найденной связке получишь сигнал
     """
-    await message.answer(welcome_text, parse_mode=ParseMode.HTML)
+    await message.answer(welcome_text)
     
     if message.from_user.id not in user_filters:
         user_filters[message.from_user.id] = {}
         user_subscriptions[message.from_user.id] = False
 
-@dp.message_handler(commands=['help'])
-async def cmd_help(message: types.Message):
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
     """Команда /help"""
     help_text = """
 📖 <b>Помощь по фильтрам</b>
@@ -402,16 +401,16 @@ async def cmd_help(message: types.Message):
 4. /set_spread 0.5
 5. /start_monitoring
     """
-    await message.answer(help_text, parse_mode=ParseMode.HTML)
+    await message.answer(help_text)
 
-@dp.message_handler(commands=['settings'])
-async def cmd_settings(message: types.Message):
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
     """Показать текущие настройки"""
     settings_text = await arbitrage_bot.get_filter_settings(message.from_user.id)
-    await message.answer(settings_text, parse_mode=ParseMode.HTML)
+    await message.answer(settings_text)
 
-@dp.message_handler(commands=['status'])
-async def cmd_status(message: types.Message):
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
     """Статус мониторинга"""
     user_id = message.from_user.id
     is_active = user_subscriptions.get(user_id, False)
@@ -422,12 +421,11 @@ async def cmd_status(message: types.Message):
     
     await message.answer(
         f"<b>Статус мониторинга:</b> {status_emoji} {status_text}\n\n"
-        f"{settings_preview}",
-        parse_mode=ParseMode.HTML
+        f"{settings_preview}"
     )
 
-@dp.message_handler(commands=['start_monitoring'])
-async def cmd_start_monitoring(message: types.Message):
+@dp.message(Command("start_monitoring"))
+async def cmd_start_monitoring(message: Message):
     """Запуск мониторинга"""
     user_id = message.from_user.id
     filters = user_filters.get(user_id, {})
@@ -446,15 +444,15 @@ async def cmd_start_monitoring(message: types.Message):
         "Для остановки используйте /stop_monitoring"
     )
 
-@dp.message_handler(commands=['stop_monitoring'])
-async def cmd_stop_monitoring(message: types.Message):
+@dp.message(Command("stop_monitoring"))
+async def cmd_stop_monitoring(message: Message):
     """Остановка мониторинга"""
     user_id = message.from_user.id
     user_subscriptions[user_id] = False
     await message.answer("⏹ Мониторинг остановлен.")
 
-@dp.message_handler(commands=['clear_filters'])
-async def cmd_clear_filters(message: types.Message):
+@dp.message(Command("clear_filters"))
+async def cmd_clear_filters(message: Message):
     """Очистка всех фильтров"""
     user_id = message.from_user.id
     user_filters[user_id] = {}
@@ -463,8 +461,8 @@ async def cmd_clear_filters(message: types.Message):
 
 # --- Команды для настройки фильтров ---
 
-@dp.message_handler(commands=['set_exact'])
-async def cmd_set_exact(message: types.Message):
+@dp.message(Command("set_exact"))
+async def cmd_set_exact(message: Message):
     try:
         args = message.text.split()
         if len(args) != 2:
@@ -488,8 +486,8 @@ async def cmd_set_exact(message: types.Message):
     except ValueError:
         await message.answer("❌ Введите корректное число")
 
-@dp.message_handler(commands=['set_min'])
-async def cmd_set_min(message: types.Message):
+@dp.message(Command("set_min"))
+async def cmd_set_min(message: Message):
     try:
         args = message.text.split()
         if len(args) != 2:
@@ -512,8 +510,8 @@ async def cmd_set_min(message: types.Message):
     except ValueError:
         await message.answer("❌ Введите корректное число")
 
-@dp.message_handler(commands=['set_max'])
-async def cmd_set_max(message: types.Message):
+@dp.message(Command("set_max"))
+async def cmd_set_max(message: Message):
     try:
         args = message.text.split()
         if len(args) != 2:
@@ -536,8 +534,8 @@ async def cmd_set_max(message: types.Message):
     except ValueError:
         await message.answer("❌ Введите корректное число")
 
-@dp.message_handler(commands=['set_spread'])
-async def cmd_set_spread(message: types.Message):
+@dp.message(Command("set_spread"))
+async def cmd_set_spread(message: Message):
     try:
         args = message.text.split()
         if len(args) != 2:
@@ -559,8 +557,8 @@ async def cmd_set_spread(message: types.Message):
     except ValueError:
         await message.answer("❌ Введите корректное число")
 
-@dp.message_handler(commands=['add_blacklist'])
-async def cmd_add_blacklist(message: types.Message):
+@dp.message(Command("add_blacklist"))
+async def cmd_add_blacklist(message: Message):
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /add_blacklist <слово>\nПример: /add_blacklist СБП")
@@ -580,8 +578,8 @@ async def cmd_add_blacklist(message: types.Message):
     else:
         await message.answer(f"⚠️ Слово '{word}' уже в черном списке")
 
-@dp.message_handler(commands=['remove_blacklist'])
-async def cmd_remove_blacklist(message: types.Message):
+@dp.message(Command("remove_blacklist"))
+async def cmd_remove_blacklist(message: Message):
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /remove_blacklist <слово>\nПример: /remove_blacklist СБП")
@@ -601,8 +599,8 @@ async def cmd_remove_blacklist(message: types.Message):
     else:
         await message.answer(f"⚠️ Слово '{word}' не найдено в черном списке")
 
-@dp.message_handler(commands=['add_whitelist'])
-async def cmd_add_whitelist(message: types.Message):
+@dp.message(Command("add_whitelist"))
+async def cmd_add_whitelist(message: Message):
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /add_whitelist <слово>\nПример: /add_whitelist Т-Банк")
@@ -622,8 +620,8 @@ async def cmd_add_whitelist(message: types.Message):
     else:
         await message.answer(f"⚠️ Слово '{word}' уже в белом списке")
 
-@dp.message_handler(commands=['remove_whitelist'])
-async def cmd_remove_whitelist(message: types.Message):
+@dp.message(Command("remove_whitelist"))
+async def cmd_remove_whitelist(message: Message):
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /remove_whitelist <слово>\nПример: /remove_whitelist Т-Банк")
@@ -643,8 +641,8 @@ async def cmd_remove_whitelist(message: types.Message):
     else:
         await message.answer(f"⚠️ Слово '{word}' не найдено в белом списке")
 
-@dp.message_handler(commands=['add_payment'])
-async def cmd_add_payment(message: types.Message):
+@dp.message(Command("add_payment"))
+async def cmd_add_payment(message: Message):
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /add_payment <система>\nПример: /add_payment Т-Банк")
@@ -664,8 +662,8 @@ async def cmd_add_payment(message: types.Message):
     else:
         await message.answer(f"⚠️ Платежная система '{payment}' уже добавлена")
 
-@dp.message_handler(commands=['remove_payment'])
-async def cmd_remove_payment(message: types.Message):
+@dp.message(Command("remove_payment"))
+async def cmd_remove_payment(message: Message):
     args = message.text.split()
     if len(args) != 2:
         await message.answer("❌ Использование: /remove_payment <система>\nПример: /remove_payment Т-Банк")
@@ -686,13 +684,25 @@ async def cmd_remove_payment(message: types.Message):
         await message.answer(f"⚠️ Платежная система '{payment}' не найдена")
 
 
-async def on_startup(dp):
+async def on_startup():
+    """Действия при запуске бота"""
     await arbitrage_bot.start()
     logger.info("Бот запущен и готов к работе!")
 
-async def on_shutdown(dp):
+async def on_shutdown():
+    """Действия при остановке бота"""
     await arbitrage_bot.stop()
     logger.info("Бот остановлен")
 
+async def main():
+    """Главная функция"""
+    try:
+        await on_startup()
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+    finally:
+        await on_shutdown()
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
+    asyncio.run(main())
