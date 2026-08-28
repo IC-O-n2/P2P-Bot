@@ -1,19 +1,15 @@
 import asyncio
 import os
-import re
 import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 
 import aiohttp
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.types import ParseMode
+from aiogram.utils import executor
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения
@@ -37,23 +33,14 @@ if not TELEGRAM_TOKEN:
 # URL API Bybit
 BYBIT_P2P_URL = "https://api.bybit.com/v5/market/p2p/orderbook"
 
-# Хранилище для фильтров пользователей (в реальном проекте использовать БД)
+# Хранилище для фильтров пользователей
 user_filters: Dict[int, Dict] = {}
 user_subscriptions: Dict[int, bool] = {}
-
-# Состояния FSM для настройки фильтров
-class FilterStates(StatesGroup):
-    waiting_for_blacklist = State()
-    waiting_for_whitelist = State()
-    waiting_for_exact_amount = State()
-    waiting_for_min_amount = State()
-    waiting_for_max_amount = State()
-    waiting_for_min_spread = State()
 
 @dataclass
 class P2POffer:
     """Класс для хранения данных P2P-объявления"""
-    side: str  # "Buy" или "Sell"
+    side: str
     price: float
     amount: float
     min_amount: float
@@ -111,8 +98,17 @@ class P2PArbitrageBot:
             }
             if payment_method:
                 params["payment"] = [payment_method]
+            
+            headers = {}
+            if BYBIT_API_KEY and BYBIT_API_SECRET:
+                # Добавляем заголовки для авторизации если есть ключи
+                headers = {
+                    "X-BAPI-API-KEY": BYBIT_API_KEY,
+                    "X-BAPI-TIMESTAMP": str(int(datetime.now().timestamp() * 1000)),
+                    "X-BAPI-SIGN": "dummy"  # Для публичных запросов не нужен
+                }
                 
-            async with self.session.get(BYBIT_P2P_URL, params=params) as response:
+            async with self.session.get(BYBIT_P2P_URL, params=params, headers=headers) as response:
                 if response.status != 200:
                     logger.error(f"Ошибка API Bybit: {response.status}")
                     return []
@@ -125,12 +121,18 @@ class P2PArbitrageBot:
                 offers = []
                 for item in data.get("result", {}).get("items", []):
                     try:
+                        # Извлекаем данные с проверкой на наличие
+                        price_str = item.get("price", "0")
+                        amount_str = item.get("amount", "0")
+                        min_amount_str = item.get("minAmount", "0")
+                        max_amount_str = item.get("maxAmount", "0")
+                        
                         offer = P2POffer(
                             side=side,
-                            price=float(item.get("price", 0)),
-                            amount=float(item.get("amount", 0)),
-                            min_amount=float(item.get("minAmount", 0)),
-                            max_amount=float(item.get("maxAmount", 0)),
+                            price=float(price_str) if price_str else 0,
+                            amount=float(amount_str) if amount_str else 0,
+                            min_amount=float(min_amount_str) if min_amount_str else 0,
+                            max_amount=float(max_amount_str) if max_amount_str else 0,
                             payment_methods=[p.get("name", "") for p in item.get("payment", [])],
                             description=item.get("description", ""),
                             link=item.get("link", ""),
@@ -149,27 +151,22 @@ class P2PArbitrageBot:
             return []
     
     def _check_offer_conditions(self, offer: P2POffer, filters: Dict) -> Tuple[bool, str]:
-        """
-        Проверка условий мейкера для объявления
-        
-        Returns:
-            (True, "OK") если проходит, (False, причина) если нет
-        """
+        """Проверка условий мейкера для объявления"""
         if not filters:
             return True, "OK"
         
         # Проверка суммы
         if filters.get("exact_amount"):
-            if offer.amount != filters["exact_amount"]:
-                return False, f"Сумма {offer.amount}₽ ≠ {filters['exact_amount']}₽"
+            if abs(offer.amount - filters["exact_amount"]) > 0.01:
+                return False, f"Сумма {offer.amount:.0f}₽ ≠ {filters['exact_amount']:.0f}₽"
         
         if filters.get("min_amount"):
             if offer.amount < filters["min_amount"]:
-                return False, f"Сумма {offer.amount}₽ < {filters['min_amount']}₽"
+                return False, f"Сумма {offer.amount:.0f}₽ < {filters['min_amount']:.0f}₽"
         
         if filters.get("max_amount"):
             if offer.amount > filters["max_amount"]:
-                return False, f"Сумма {offer.amount}₽ > {filters['max_amount']}₽"
+                return False, f"Сумма {offer.amount:.0f}₽ > {filters['max_amount']:.0f}₽"
         
         # Проверка текстовых условий
         description_lower = offer.description.lower()
@@ -204,13 +201,13 @@ class P2PArbitrageBot:
         # Фильтруем продавцов и покупателей по условиям
         filtered_sellers = []
         for seller in sellers:
-            passes, reason = self._check_offer_conditions(seller, user_filters)
+            passes, _ = self._check_offer_conditions(seller, user_filters)
             if passes:
                 filtered_sellers.append(seller)
         
         filtered_buyers = []
         for buyer in buyers:
-            passes, reason = self._check_offer_conditions(buyer, user_filters)
+            passes, _ = self._check_offer_conditions(buyer, user_filters)
             if passes:
                 filtered_buyers.append(buyer)
         
@@ -264,7 +261,7 @@ class P2PArbitrageBot:
                         await self._send_signal(user_id, signal)
                 
                 # Ждем перед следующим циклом
-                await asyncio.sleep(10)  # Каждые 10 секунд
+                await asyncio.sleep(10)
                 
             except asyncio.CancelledError:
                 break
@@ -274,6 +271,10 @@ class P2PArbitrageBot:
     
     async def _send_signal(self, user_id: int, signal: ArbitrageSignal):
         """Отправка сигнала пользователю"""
+        # Ограничиваем количество символов в описании
+        seller_desc = signal.seller.description[:100] + "..." if len(signal.seller.description) > 100 else signal.seller.description
+        buyer_desc = signal.buyer.description[:100] + "..." if len(signal.buyer.description) > 100 else signal.buyer.description
+        
         message = f"""
 🔥 <b>АРБИТРАЖНЫЙ СИГНАЛ</b> 🔥
 
@@ -281,14 +282,14 @@ class P2PArbitrageBot:
 • Курс: {signal.seller.price:.2f}₽
 • Сумма: {signal.seller.amount:,.0f}₽
 • Лимиты: {signal.seller.min_amount:,.0f} - {signal.seller.max_amount:,.0f}₽
-• Платежи: {', '.join(signal.seller.payment_methods)}
+• Платежи: {', '.join(signal.seller.payment_methods) if signal.seller.payment_methods else 'Любые'}
 • Мерчант: {signal.seller.merchant_name} {'✅' if signal.seller.is_verified else '❌'}
 
 <b>🔴 ПОКУПАТЕЛЬ (BUYER)</b>
 • Курс: {signal.buyer.price:.2f}₽
 • Сумма: {signal.buyer.amount:,.0f}₽
 • Лимиты: {signal.buyer.min_amount:,.0f} - {signal.buyer.max_amount:,.0f}₽
-• Платежи: {', '.join(signal.buyer.payment_methods)}
+• Платежи: {', '.join(signal.buyer.payment_methods) if signal.buyer.payment_methods else 'Любые'}
 • Мерчант: {signal.buyer.merchant_name} {'✅' if signal.buyer.is_verified else '❌'}
 
 <b>📊 РАСЧЕТ</b>
@@ -296,8 +297,8 @@ class P2PArbitrageBot:
 • Прибыль с 1 USDT: {signal.profit:.2f}₽
 
 <b>🔗 Ссылки:</b>
-Продавец: {signal.seller.link}
-Покупатель: {signal.buyer.link}
+Продавец: {signal.seller.link if signal.seller.link else 'Нет ссылки'}
+Покупатель: {signal.buyer.link if signal.buyer.link else 'Нет ссылки'}
 
 ⏰ {signal.timestamp.strftime('%H:%M:%S')}
         """
@@ -306,7 +307,7 @@ class P2PArbitrageBot:
             await self.bot.send_message(
                 user_id,
                 message,
-                parse_mode="HTML"
+                parse_mode=ParseMode.HTML
             )
             logger.info(f"Сигнал отправлен пользователю {user_id}")
         except Exception as e:
@@ -320,13 +321,14 @@ class P2PArbitrageBot:
         
         settings = []
         settings.append("📋 <b>Текущие настройки фильтров:</b>")
+        settings.append("")
         
         if filters.get("exact_amount"):
-            settings.append(f"• Точная сумма: {filters['exact_amount']}₽")
+            settings.append(f"• Точная сумма: {filters['exact_amount']:.0f}₽")
         if filters.get("min_amount"):
-            settings.append(f"• Мин. сумма: {filters['min_amount']}₽")
+            settings.append(f"• Мин. сумма: {filters['min_amount']:.0f}₽")
         if filters.get("max_amount"):
-            settings.append(f"• Макс. сумма: {filters['max_amount']}₽")
+            settings.append(f"• Макс. сумма: {filters['max_amount']:.0f}₽")
         if filters.get("min_spread"):
             settings.append(f"• Мин. спред: {filters['min_spread']}%")
         if filters.get("blacklist"):
@@ -336,19 +338,22 @@ class P2PArbitrageBot:
         if filters.get("payment_methods"):
             settings.append(f"• Платежные системы: {', '.join(filters['payment_methods'])}")
         
+        if len(settings) == 2:
+            settings.append("⚠️ Фильтры настроены, но неактивны (запустите /start_monitoring)")
+        
         return "\n".join(settings)
 
 
-# Инициализация бота и диспетчера
+# Инициализация бота
 bot = Bot(token=TELEGRAM_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
 arbitrage_bot = P2PArbitrageBot(bot)
 
 # --- Обработчики команд ---
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
     """Команда /start"""
     welcome_text = """
 🚀 <b>Добро пожаловать в P2P Арбитраж Бот!</b>
@@ -370,15 +375,15 @@ async def cmd_start(message: Message):
 3. Бот будет искать выгодные связки
 4. При найденной связке получишь сигнал
     """
-    await message.answer(welcome_text, parse_mode="HTML")
+    await message.answer(welcome_text, parse_mode=ParseMode.HTML)
     
     # Создаем фильтры для пользователя
     if message.from_user.id not in user_filters:
         user_filters[message.from_user.id] = {}
         user_subscriptions[message.from_user.id] = False
 
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
+@dp.message_handler(commands=['help'])
+async def cmd_help(message: types.Message):
     """Команда /help"""
     help_text = """
 📖 <b>Помощь по фильтрам</b>
@@ -409,23 +414,23 @@ async def cmd_help(message: Message):
    • /status - текущий статус
    • /clear_filters - очистить все фильтры
 
-<b>Пример:</b>
+<b>Пример настройки:</b>
 1. /set_exact 28000
 2. /add_blacklist СБП
 3. /add_whitelist Т-Банк
 4. /set_spread 0.5
 5. /start_monitoring
     """
-    await message.answer(help_text, parse_mode="HTML")
+    await message.answer(help_text, parse_mode=ParseMode.HTML)
 
-@dp.message(Command("settings"))
-async def cmd_settings(message: Message):
+@dp.message_handler(commands=['settings'])
+async def cmd_settings(message: types.Message):
     """Показать текущие настройки"""
     settings_text = await arbitrage_bot.get_filter_settings(message.from_user.id)
-    await message.answer(settings_text, parse_mode="HTML")
+    await message.answer(settings_text, parse_mode=ParseMode.HTML)
 
-@dp.message(Command("status"))
-async def cmd_status(message: Message):
+@dp.message_handler(commands=['status'])
+async def cmd_status(message: types.Message):
     """Статус мониторинга"""
     user_id = message.from_user.id
     is_active = user_subscriptions.get(user_id, False)
@@ -437,11 +442,11 @@ async def cmd_status(message: Message):
     await message.answer(
         f"<b>Статус мониторинга:</b> {status_emoji} {status_text}\n\n"
         f"{settings_preview}",
-        parse_mode="HTML"
+        parse_mode=ParseMode.HTML
     )
 
-@dp.message(Command("start_monitoring"))
-async def cmd_start_monitoring(message: Message):
+@dp.message_handler(commands=['start_monitoring'])
+async def cmd_start_monitoring(message: types.Message):
     """Запуск мониторинга"""
     user_id = message.from_user.id
     filters = user_filters.get(user_id, {})
@@ -460,15 +465,15 @@ async def cmd_start_monitoring(message: Message):
         "Для остановки используйте /stop_monitoring"
     )
 
-@dp.message(Command("stop_monitoring"))
-async def cmd_stop_monitoring(message: Message):
+@dp.message_handler(commands=['stop_monitoring'])
+async def cmd_stop_monitoring(message: types.Message):
     """Остановка мониторинга"""
     user_id = message.from_user.id
     user_subscriptions[user_id] = False
     await message.answer("⏹ Мониторинг остановлен.")
 
-@dp.message(Command("clear_filters"))
-async def cmd_clear_filters(message: Message):
+@dp.message_handler(commands=['clear_filters'])
+async def cmd_clear_filters(message: types.Message):
     """Очистка всех фильтров"""
     user_id = message.from_user.id
     user_filters[user_id] = {}
@@ -477,8 +482,8 @@ async def cmd_clear_filters(message: Message):
 
 # --- Команды для настройки фильтров ---
 
-@dp.message(Command("set_exact"))
-async def cmd_set_exact(message: Message):
+@dp.message_handler(commands=['set_exact'])
+async def cmd_set_exact(message: types.Message):
     """Установка точной суммы"""
     try:
         args = message.text.split()
@@ -495,7 +500,6 @@ async def cmd_set_exact(message: Message):
         if user_id not in user_filters:
             user_filters[user_id] = {}
         
-        # Очищаем min и max если устанавливаем точную сумму
         user_filters[user_id].pop("min_amount", None)
         user_filters[user_id].pop("max_amount", None)
         user_filters[user_id]["exact_amount"] = amount
@@ -504,8 +508,8 @@ async def cmd_set_exact(message: Message):
     except ValueError:
         await message.answer("❌ Введите корректное число")
 
-@dp.message(Command("set_min"))
-async def cmd_set_min(message: Message):
+@dp.message_handler(commands=['set_min'])
+async def cmd_set_min(message: types.Message):
     """Установка минимальной суммы"""
     try:
         args = message.text.split()
@@ -529,8 +533,8 @@ async def cmd_set_min(message: Message):
     except ValueError:
         await message.answer("❌ Введите корректное число")
 
-@dp.message(Command("set_max"))
-async def cmd_set_max(message: Message):
+@dp.message_handler(commands=['set_max'])
+async def cmd_set_max(message: types.Message):
     """Установка максимальной суммы"""
     try:
         args = message.text.split()
@@ -554,8 +558,8 @@ async def cmd_set_max(message: Message):
     except ValueError:
         await message.answer("❌ Введите корректное число")
 
-@dp.message(Command("set_spread"))
-async def cmd_set_spread(message: Message):
+@dp.message_handler(commands=['set_spread'])
+async def cmd_set_spread(message: types.Message):
     """Установка минимального спреда"""
     try:
         args = message.text.split()
@@ -578,8 +582,8 @@ async def cmd_set_spread(message: Message):
     except ValueError:
         await message.answer("❌ Введите корректное число")
 
-@dp.message(Command("add_blacklist"))
-async def cmd_add_blacklist(message: Message):
+@dp.message_handler(commands=['add_blacklist'])
+async def cmd_add_blacklist(message: types.Message):
     """Добавление слова в черный список"""
     args = message.text.split()
     if len(args) != 2:
@@ -600,8 +604,8 @@ async def cmd_add_blacklist(message: Message):
     else:
         await message.answer(f"⚠️ Слово '{word}' уже в черном списке")
 
-@dp.message(Command("remove_blacklist"))
-async def cmd_remove_blacklist(message: Message):
+@dp.message_handler(commands=['remove_blacklist'])
+async def cmd_remove_blacklist(message: types.Message):
     """Удаление слова из черного списка"""
     args = message.text.split()
     if len(args) != 2:
@@ -622,8 +626,8 @@ async def cmd_remove_blacklist(message: Message):
     else:
         await message.answer(f"⚠️ Слово '{word}' не найдено в черном списке")
 
-@dp.message(Command("add_whitelist"))
-async def cmd_add_whitelist(message: Message):
+@dp.message_handler(commands=['add_whitelist'])
+async def cmd_add_whitelist(message: types.Message):
     """Добавление слова в белый список"""
     args = message.text.split()
     if len(args) != 2:
@@ -644,8 +648,8 @@ async def cmd_add_whitelist(message: Message):
     else:
         await message.answer(f"⚠️ Слово '{word}' уже в белом списке")
 
-@dp.message(Command("remove_whitelist"))
-async def cmd_remove_whitelist(message: Message):
+@dp.message_handler(commands=['remove_whitelist'])
+async def cmd_remove_whitelist(message: types.Message):
     """Удаление слова из белого списка"""
     args = message.text.split()
     if len(args) != 2:
@@ -666,8 +670,8 @@ async def cmd_remove_whitelist(message: Message):
     else:
         await message.answer(f"⚠️ Слово '{word}' не найдено в белом списке")
 
-@dp.message(Command("add_payment"))
-async def cmd_add_payment(message: Message):
+@dp.message_handler(commands=['add_payment'])
+async def cmd_add_payment(message: types.Message):
     """Добавление платежной системы"""
     args = message.text.split()
     if len(args) != 2:
@@ -688,8 +692,8 @@ async def cmd_add_payment(message: Message):
     else:
         await message.answer(f"⚠️ Платежная система '{payment}' уже добавлена")
 
-@dp.message(Command("remove_payment"))
-async def cmd_remove_payment(message: Message):
+@dp.message_handler(commands=['remove_payment'])
+async def cmd_remove_payment(message: types.Message):
     """Удаление платежной системы"""
     args = message.text.split()
     if len(args) != 2:
@@ -713,26 +717,17 @@ async def cmd_remove_payment(message: Message):
 
 # --- Обработчик запуска ---
 
-@dp.startup()
-async def on_startup():
+async def on_startup(dp):
     """Действия при запуске бота"""
     await arbitrage_bot.start()
     logger.info("Бот запущен и готов к работе!")
 
-@dp.shutdown()
-async def on_shutdown():
+async def on_shutdown(dp):
     """Действия при остановке бота"""
     await arbitrage_bot.stop()
     logger.info("Бот остановлен")
 
-async def main():
-    """Главная функция"""
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
-    finally:
-        await arbitrage_bot.stop()
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Запуск бота
+    from aiogram import executor
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
