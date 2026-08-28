@@ -280,80 +280,89 @@ class P2PArbitrageBot:
             return "Ссылка недоступна"
         return f"https://www.bybit.com/p2p/order/{item_id}"
     
-    def _find_arbitrage(self, sellers: List[P2POffer], buyers: List[P2POffer],
-                        user_filters: Dict) -> Optional[ArbitrageSignal]:
-        """Поиск арбитражной связки"""
+    def _find_all_arbitrage_signals(self, sellers: List[P2POffer], buyers: List[P2POffer],
+                                     user_filters: Dict) -> List[ArbitrageSignal]:
+        """Находит ВСЕ арбитражные связки, а не только одну"""
         if not sellers or not buyers:
-            return None
-        
-        # Логируем количество до фильтрации
-        logger.debug(f"До фильтрации: SELL={len(sellers)}, BUY={len(buyers)}")
+            return []
         
         # Фильтруем продавцов и покупателей по условиям
         filtered_sellers = []
         for seller in sellers:
-            passes, reason = self._check_offer_conditions(seller, user_filters)
+            passes, _ = self._check_offer_conditions(seller, user_filters)
             if passes:
                 filtered_sellers.append(seller)
-            else:
-                logger.debug(f"Seller {seller.merchant_name} отклонен: {reason}")
         
         filtered_buyers = []
         for buyer in buyers:
-            passes, reason = self._check_offer_conditions(buyer, user_filters)
+            passes, _ = self._check_offer_conditions(buyer, user_filters)
             if passes:
                 filtered_buyers.append(buyer)
-            else:
-                logger.debug(f"Buyer {buyer.merchant_name} отклонен: {reason}")
-        
-        logger.debug(f"После фильтрации: SELL={len(filtered_sellers)}, BUY={len(filtered_buyers)}")
         
         if not filtered_sellers or not filtered_buyers:
-            return None
+            return []
         
-        # Берем лучшего продавца (самый дешевый) и покупателя (самый дорогой)
-        best_seller = min(filtered_sellers, key=lambda x: x.price)
-        best_buyer = max(filtered_buyers, key=lambda x: x.price)
+        # Сортируем продавцов по возрастанию цены (самые дешевые сверху)
+        filtered_sellers.sort(key=lambda x: x.price)
+        # Сортируем покупателей по убыванию цены (самые дорогие сверху)
+        filtered_buyers.sort(key=lambda x: x.price, reverse=True)
         
-        # Проверяем, что продавец дешевле покупателя
-        if best_seller.price >= best_buyer.price:
-            return None
-        
-        spread = ((best_buyer.price / best_seller.price) - 1) * 100
-        
-        # Проверка минимального спреда
+        signals = []
         min_spread = user_filters.get("min_spread", 0.5)
-        if spread < min_spread:
-            return None
         
-        # Расчет максимальной суммы сделки с учетом пересечения лимитов
-        max_trade_amount = min(best_seller.max_amount, best_buyer.max_amount)
-        min_trade_amount = max(best_seller.min_amount, best_buyer.min_amount)
+        # Перебираем всех продавцов и покупателей, находим все возможные связки
+        for seller in filtered_sellers[:20]:  # Ограничиваем первыми 20 продавцами
+            for buyer in filtered_buyers[:20]:  # Ограничиваем первыми 20 покупателями
+                # Проверяем, что продавец дешевле покупателя
+                if seller.price >= buyer.price:
+                    continue
+                
+                spread = ((buyer.price / seller.price) - 1) * 100
+                
+                # Проверка минимального спреда
+                if spread < min_spread:
+                    continue
+                
+                # Проверяем пересечение лимитов
+                max_trade_amount = min(seller.max_amount, buyer.max_amount)
+                min_trade_amount = max(seller.min_amount, buyer.min_amount)
+                
+                if max_trade_amount < min_trade_amount:
+                    continue
+                
+                # Проверяем ограничения пользователя
+                if user_filters.get("min_amount"):
+                    if max_trade_amount < user_filters["min_amount"]:
+                        continue
+                
+                if user_filters.get("max_amount"):
+                    if min_trade_amount > user_filters["max_amount"]:
+                        continue
+                
+                # Расчет прибыли
+                trade_amount = max_trade_amount
+                usdt_amount = trade_amount / seller.price if seller.price > 0 else 0
+                profit_per_usdt = buyer.price - seller.price
+                total_profit_rub = usdt_amount * profit_per_usdt
+                
+                # Создаем уникальный ID сигнала
+                signal_id = f"{seller.item_id}_{buyer.item_id}"
+                
+                signal = ArbitrageSignal(
+                    seller=seller,
+                    buyer=buyer,
+                    spread=spread,
+                    profit=profit_per_usdt,
+                    profit_rub=total_profit_rub,
+                    timestamp=datetime.now(),
+                    signal_id=signal_id
+                )
+                signals.append(signal)
         
-        # Проверяем, что диапазоны пересекаются
-        if max_trade_amount < min_trade_amount:
-            return None
+        # Сортируем сигналы по прибыли (самые выгодные сверху)
+        signals.sort(key=lambda x: x.profit_rub, reverse=True)
         
-        # Используем максимальную возможную сумму
-        trade_amount = max_trade_amount
-        
-        # Количество USDT
-        usdt_amount = trade_amount / best_seller.price if best_seller.price > 0 else 0
-        profit_per_usdt = best_buyer.price - best_seller.price
-        total_profit_rub = usdt_amount * profit_per_usdt
-        
-        # Создаем уникальный ID сигнала
-        signal_id = f"{best_seller.item_id}_{best_buyer.item_id}_{best_seller.price:.2f}_{best_buyer.price:.2f}"
-        
-        return ArbitrageSignal(
-            seller=best_seller,
-            buyer=best_buyer,
-            spread=spread,
-            profit=profit_per_usdt,
-            profit_rub=total_profit_rub,
-            timestamp=datetime.now(),
-            signal_id=signal_id
-        )
+        return signals
     
     async def _monitor_loop(self):
         """Основной цикл мониторинга"""
@@ -380,21 +389,31 @@ class P2PArbitrageBot:
                         logger.debug("Нет данных для поиска арбитража")
                         continue
                     
-                    # Ищем арбитраж
-                    signal = self._find_arbitrage(sellers, buyers, filters)
+                    # Находим ВСЕ сигналы
+                    signals = self._find_all_arbitrage_signals(sellers, buyers, filters)
                     
-                    if signal:
+                    if signals:
+                        logger.info(f"Найдено {len(signals)} сигналов для пользователя {user_id}")
+                        
                         if user_id not in sent_signals:
                             sent_signals[user_id] = set()
                         
-                        if signal.signal_id not in sent_signals[user_id]:
-                            await self._send_signal(user_id, signal)
-                            sent_signals[user_id].add(signal.signal_id)
-                            logger.info(f"Новый сигнал отправлен пользователю {user_id}: {signal.signal_id}")
-                            
-                            # Очищаем старые сигналы
-                            if len(sent_signals[user_id]) > 100:
-                                sent_signals[user_id] = set()
+                        # Отправляем каждый новый сигнал
+                        sent_count = 0
+                        for signal in signals[:20]:  # Ограничиваем 20 сигналами за раз
+                            if signal.signal_id not in sent_signals[user_id]:
+                                await self._send_signal(user_id, signal)
+                                sent_signals[user_id].add(signal.signal_id)
+                                sent_count += 1
+                                # Небольшая задержка между отправками, чтобы не спамить
+                                await asyncio.sleep(0.5)
+                        
+                        if sent_count > 0:
+                            logger.info(f"Отправлено {sent_count} новых сигналов пользователю {user_id}")
+                        
+                        # Очищаем старые сигналы (старше 1 часа или больше 500)
+                        if len(sent_signals[user_id]) > 500:
+                            sent_signals[user_id] = set()
                 
                 await asyncio.sleep(15)
                 
@@ -452,7 +471,6 @@ class P2PArbitrageBot:
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=False
             )
-            logger.info(f"Сигнал отправлен пользователю {user_id}")
         except Exception as e:
             logger.error(f"Ошибка отправки сигнала: {e}")
     
