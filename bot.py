@@ -61,7 +61,7 @@ class P2POffer:
     link: str
     merchant_name: str
     is_verified: bool
-    item_id: str  # ID объявления для создания ссылки
+    item_id: str
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -74,7 +74,7 @@ class ArbitrageSignal:
     profit: float
     profit_rub: float
     timestamp: datetime
-    signal_id: str  # Уникальный ID для предотвращения дублирования
+    signal_id: str
 
 class BybitP2PClient:
     """Клиент для работы с P2P API Bybit"""
@@ -169,8 +169,7 @@ class BybitP2PClient:
                     if name:
                         payment_methods.append(name)
                 
-                # Получаем ID объявления
-                item_id = item.get("itemId", "")
+                item_id = str(item.get("itemId", ""))
                 
                 offer = P2POffer(
                     side=side,
@@ -180,7 +179,7 @@ class BybitP2PClient:
                     max_amount=max_amount,
                     payment_methods=payment_methods,
                     description=item.get("description", ""),
-                    link="",  # Ссылку сгенерируем позже
+                    link="",
                     merchant_name=item.get("nickName", "Аноним"),
                     is_verified=item.get("isVerified", False),
                     item_id=item_id
@@ -241,35 +240,32 @@ class P2PArbitrageBot:
         if not filters:
             return True, "OK"
         
-        # Проверка суммы
+        # Проверка суммы - используем max_amount для проверки вхождения в диапазон
         if filters.get("exact_amount"):
-            if abs(offer.amount - filters["exact_amount"]) > 0.01:
-                return False, f"Сумма {offer.amount:.0f}₽ ≠ {filters['exact_amount']:.0f}₽"
+            if not (offer.min_amount <= filters["exact_amount"] <= offer.max_amount):
+                return False, f"Сумма {filters['exact_amount']:.0f}₽ не входит в лимиты {offer.min_amount:.0f}-{offer.max_amount:.0f}₽"
         
         if filters.get("min_amount"):
-            if offer.amount < filters["min_amount"]:
-                return False, f"Сумма {offer.amount:.0f}₽ < {filters['min_amount']:.0f}₽"
+            if offer.max_amount < filters["min_amount"]:
+                return False, f"Макс. сумма {offer.max_amount:.0f}₽ < {filters['min_amount']:.0f}₽"
         
         if filters.get("max_amount"):
-            if offer.amount > filters["max_amount"]:
-                return False, f"Сумма {offer.amount:.0f}₽ > {filters['max_amount']:.0f}₽"
+            if offer.min_amount > filters["max_amount"]:
+                return False, f"Мин. сумма {offer.min_amount:.0f}₽ > {filters['max_amount']:.0f}₽"
         
-        # Проверка текстовых условий (игнорируем регистр)
+        # Проверка текстовых условий
         description_lower = offer.description.lower()
         
-        # Черный список - исключаем объявления с этими словами
         for word in filters.get("blacklist", []):
             if word.lower() in description_lower:
                 return False, f"Найдено запрещенное слово: {word}"
         
-        # Белый список - требуем наличие хотя бы одного из этих слов
         whitelist = filters.get("whitelist", [])
         if whitelist:
             found = any(word.lower() in description_lower for word in whitelist)
             if not found:
                 return False, f"Нет обязательных слов из: {', '.join(whitelist)}"
         
-        # Проверка платежных систем
         if filters.get("payment_methods"):
             offer_methods = [m.lower() for m in offer.payment_methods]
             required = [m.lower() for m in filters["payment_methods"]]
@@ -280,9 +276,8 @@ class P2PArbitrageBot:
     
     def _generate_offer_url(self, item_id: str) -> str:
         """Генерирует ссылку на объявление Bybit"""
-        if not item_id:
+        if not item_id or item_id == "0" or item_id == "":
             return "Ссылка недоступна"
-        # Формат ссылки для P2P объявления Bybit
         return f"https://www.bybit.com/p2p/order/{item_id}"
     
     def _find_arbitrage(self, sellers: List[P2POffer], buyers: List[P2POffer],
@@ -291,18 +286,27 @@ class P2PArbitrageBot:
         if not sellers or not buyers:
             return None
         
+        # Логируем количество до фильтрации
+        logger.debug(f"До фильтрации: SELL={len(sellers)}, BUY={len(buyers)}")
+        
         # Фильтруем продавцов и покупателей по условиям
         filtered_sellers = []
         for seller in sellers:
-            passes, _ = self._check_offer_conditions(seller, user_filters)
+            passes, reason = self._check_offer_conditions(seller, user_filters)
             if passes:
                 filtered_sellers.append(seller)
+            else:
+                logger.debug(f"Seller {seller.merchant_name} отклонен: {reason}")
         
         filtered_buyers = []
         for buyer in buyers:
-            passes, _ = self._check_offer_conditions(buyer, user_filters)
+            passes, reason = self._check_offer_conditions(buyer, user_filters)
             if passes:
                 filtered_buyers.append(buyer)
+            else:
+                logger.debug(f"Buyer {buyer.merchant_name} отклонен: {reason}")
+        
+        logger.debug(f"После фильтрации: SELL={len(filtered_sellers)}, BUY={len(filtered_buyers)}")
         
         if not filtered_sellers or not filtered_buyers:
             return None
@@ -322,31 +326,24 @@ class P2PArbitrageBot:
         if spread < min_spread:
             return None
         
-        # Расчет максимальной прибыли с учетом лимитов
-        max_amount = min(
-            best_seller.max_amount,
-            best_buyer.max_amount,
-            user_filters.get("max_amount", float('inf'))
-        )
+        # Расчет максимальной суммы сделки с учетом пересечения лимитов
+        max_trade_amount = min(best_seller.max_amount, best_buyer.max_amount)
+        min_trade_amount = max(best_seller.min_amount, best_buyer.min_amount)
         
-        min_amount = max(
-            best_seller.min_amount,
-            best_buyer.min_amount,
-            user_filters.get("min_amount", 0)
-        )
+        # Проверяем, что диапазоны пересекаются
+        if max_trade_amount < min_trade_amount:
+            return None
         
-        trade_amount = min(max_amount, max_amount)
-        if trade_amount < min_amount:
-            trade_amount = min_amount
+        # Используем максимальную возможную сумму
+        trade_amount = max_trade_amount
         
-        if trade_amount <= 0:
-            trade_amount = (best_seller.min_amount + best_seller.max_amount) / 2
-        
+        # Количество USDT
         usdt_amount = trade_amount / best_seller.price if best_seller.price > 0 else 0
         profit_per_usdt = best_buyer.price - best_seller.price
         total_profit_rub = usdt_amount * profit_per_usdt
         
-        signal_id = f"{best_seller.merchant_name}_{best_buyer.merchant_name}_{best_seller.price:.2f}_{best_buyer.price:.2f}_{best_seller.item_id}_{best_buyer.item_id}"
+        # Создаем уникальный ID сигнала
+        signal_id = f"{best_seller.item_id}_{best_buyer.item_id}_{best_seller.price:.2f}_{best_buyer.price:.2f}"
         
         return ArbitrageSignal(
             seller=best_seller,
@@ -393,7 +390,9 @@ class P2PArbitrageBot:
                         if signal.signal_id not in sent_signals[user_id]:
                             await self._send_signal(user_id, signal)
                             sent_signals[user_id].add(signal.signal_id)
+                            logger.info(f"Новый сигнал отправлен пользователю {user_id}: {signal.signal_id}")
                             
+                            # Очищаем старые сигналы
                             if len(sent_signals[user_id]) > 100:
                                 sent_signals[user_id] = set()
                 
@@ -417,7 +416,9 @@ class P2PArbitrageBot:
         seller_url = self._generate_offer_url(signal.seller.item_id)
         buyer_url = self._generate_offer_url(signal.buyer.item_id)
         
-        usdt_amount = signal.seller.max_amount / signal.seller.price if signal.seller.price > 0 else 0
+        # Расчет максимальной суммы сделки
+        trade_amount = min(signal.seller.max_amount, signal.buyer.max_amount)
+        usdt_amount = trade_amount / signal.seller.price if signal.seller.price > 0 else 0
         
         message = f"""
 🔥 <b>АРБИТРАЖНЫЙ СИГНАЛ</b> 🔥
@@ -427,22 +428,21 @@ class P2PArbitrageBot:
 • Лимиты: {signal.seller.min_amount:,.0f} - {signal.seller.max_amount:,.0f}₽
 • Платежи: {escape_html(seller_payments)}
 • Мерчант: {escape_html(signal.seller.merchant_name)} {'✅' if signal.seller.is_verified else '❌'}
-• <a href="{seller_url}">🔗 Ссылка на ордер SELLER</a>
+• <a href="{seller_url}">🔗 Перейти к ордеру SELLER</a>
 
 <b>🔴 ПОКУПАТЕЛЬ (BUYER) - ему продаем USDT</b>
 • Курс: {signal.buyer.price:.2f}₽
 • Лимиты: {signal.buyer.min_amount:,.0f} - {signal.buyer.max_amount:,.0f}₽
 • Платежи: {escape_html(buyer_payments)}
 • Мерчант: {escape_html(signal.buyer.merchant_name)} {'✅' if signal.buyer.is_verified else '❌'}
-• <a href="{buyer_url}">🔗 Ссылка на ордер BUYER</a>
+• <a href="{buyer_url}">🔗 Перейти к ордеру BUYER</a>
 
 <b>📊 РАСЧЕТ ПРИБЫЛИ</b>
 • Спред: <b>{signal.spread:.2f}%</b>
 • Прибыль с 1 USDT: {signal.profit:.2f}₽
-• Макс. USDT: {usdt_amount:.2f}
+• Сумма сделки: {trade_amount:,.0f}₽
+• USDT: {usdt_amount:.2f}
 • <b>💰 ПРИБЫЛЬ: {signal.profit_rub:,.2f}₽</b>
-
-⏰ {signal.timestamp.strftime('%H:%M:%S')}
         """
         
         try:
