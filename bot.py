@@ -1,9 +1,12 @@
 import os
-import requests
-import json
-import time
 import hashlib
 import hmac
+import json
+import time
+from decimal import Decimal
+from typing import Any
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 # --- 1. Получение ключей из переменных окружения Railway ---
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
@@ -17,110 +20,125 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 print("🚀 Запуск P2P мониторинга Bybit...")
 print("="*60)
 
-# --- 2. Функция для подписанного POST запроса (согласно примеру) ---
+# --- 2. Функция для подписанного POST запроса (как в bybit_client.py) ---
 
-def bybit_signed_post(endpoint, params):
-    """Выполняет подписанный POST запрос к API Bybit"""
+def post_signed(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Выполняет подписанный POST запрос к Bybit API"""
     
     base_url = "https://api.bybit.com"
+    api_key = BYBIT_API_KEY
+    api_secret = BYBIT_API_SECRET
+    recv_window_ms = 5000
+    timeout_seconds = 15
+    
     timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     
-    # Преобразуем параметры в JSON строку без пробелов
-    json_body = json.dumps(params, separators=(',', ':'))
+    # Строка для подписи: timestamp + api_key + recv_window + body
+    signature_payload = f"{timestamp}{api_key}{recv_window_ms}{body}"
     
-    # Строка для подписи: timestamp + api_key + recv_window + jsonBodyString
-    sign_str = timestamp + BYBIT_API_KEY + recv_window + json_body
-    
-    # Создание подписи HMAC-SHA256
     signature = hmac.new(
-        bytes(BYBIT_API_SECRET, "utf-8"),
-        bytes(sign_str, "utf-8"),
-        hashlib.sha256
+        api_secret.encode("utf-8"),
+        signature_payload.encode("utf-8"),
+        hashlib.sha256,
     ).hexdigest()
     
-    # Заголовки
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "Content-Type": "application/json"
-    }
+    request = Request(
+        f"{base_url}{path}",
+        data=body.encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-TIMESTAMP": timestamp,
+            "X-BAPI-RECV-WINDOW": str(recv_window_ms),
+            "X-BAPI-SIGN": signature,
+        },
+        method="POST",
+    )
     
-    url = base_url + endpoint
-    
-    # Отладка
-    print(f"   🔑 Подпись: {signature[:20]}...")
-    print(f"   📝 JSON: {json_body}")
+    print(f"   🔑 Подпись создана")
+    print(f"   📝 Тело: {body}")
     
     try:
-        response = requests.post(url, json=params, headers=headers, timeout=10)
-        return response.json()
-    except Exception as e:
-        print(f"   ❌ Ошибка запроса: {e}")
-        return None
+        with urlopen(request, timeout=timeout_seconds) as response:
+            http_status_code = response.getcode()
+            response_body = response.read().decode("utf-8")
+    except HTTPError as error:
+        try:
+            response_body = error.read().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            response_body = ""
+        print(f"   ❌ HTTP ошибка: {error.code}")
+        print(f"   Ответ: {response_body[:200]}")
+        return {}
+    except (URLError, TimeoutError, OSError) as error:
+        print(f"   ❌ Ошибка соединения: {error}")
+        return {}
+    
+    try:
+        parsed = json.loads(response_body)
+        print(f"   📊 Ответ получен, код: {parsed.get('retCode', parsed.get('ret_code', 'N/A'))}")
+        return parsed
+    except json.JSONDecodeError as error:
+        print(f"   ❌ Ошибка парсинга JSON: {error}")
+        print(f"   Ответ: {response_body[:200]}")
+        return {}
 
-# --- 3. Функция для получения P2P объявлений ---
+# --- 3. Функция для получения P2P объявлений (как в bybit_client.py) ---
 
-def get_p2p_orders(side, coin="USDT", fiat="RUB", limit=5):
+def get_online_ads(action: str, page: int = 1, size: int = 5) -> list:
     """Получает P2P объявления с Bybit"""
     
-    # Параметры для P2P запроса
-    params = {
-        "coinId": "USDT",
-        "currencyId": "RUB",
-        "side": side,  # "BUY" или "SELL"
-        "page": "1",
-        "size": str(limit)
-    }
-    
-    print(f"\n📡 Запрос {side} объявлений...")
-    
-    response = bybit_signed_post("/v5/p2p/item/online", params)
-    
-    if response:
-        ret_code = response.get("retCode")
-        ret_msg = response.get("retMsg", "")
-        
-        print(f"   📊 Ответ: retCode={ret_code}, retMsg={ret_msg}")
-        
-        if ret_code == 0 or ret_msg.lower() in ["ok", "success"]:
-            items = response.get("result", {}).get("items", [])
-            print(f"   ✅ Получено {len(items)} объявлений")
-            return items
-        else:
-            print(f"   ❌ Ошибка: {ret_msg}")
-            return []
+    # Bybit side: 0 - покупка USDT (продажа RUB), 1 - продажа USDT (покупка RUB)
+    if action == "BUY":
+        bybit_side = 0
+    elif action == "SELL":
+        bybit_side = 1
     else:
-        print("   ❌ Нет ответа от API")
+        raise ValueError("action must be BUY or SELL")
+    
+    print(f"\n📡 Запрос {action} объявлений (side={bybit_side})...")
+    
+    result = post_signed(
+        "/v5/p2p/item/online",
+        {
+            "tokenId": "USDT",      # Токен (вместо coinId)
+            "currencyId": "RUB",    # Валюта (вместо currencyId)
+            "side": str(bybit_side),
+            "page": str(page),
+            "size": str(size),
+        },
+    )
+    
+    # Извлекаем объявления из ответа
+    items = result.get("result", {}).get("items", [])
+    if not items:
+        print(f"   ⚠️ Объявлений не найдено")
         return []
+    
+    print(f"   ✅ Получено {len(items)} объявлений")
+    return items
 
-# --- 4. Проверка соединения с API ---
+# --- 4. Проверка соединения ---
 
 print("📊 Проверка соединения с Bybit API...")
 
 try:
-    # Проверяем время сервера
-    time_response = requests.get("https://api.bybit.com/v5/market/time")
-    if time_response.status_code == 200:
-        time_data = time_response.json()
-        print(f"✅ Сервер Bybit доступен")
-        print(f"   Время сервера: {time_data.get('result', {}).get('timeSecond')}")
-    else:
-        print(f"❌ Ошибка доступа: {time_response.status_code}")
+    # Простой GET запрос для проверки
+    from urllib.request import urlopen
+    time_response = urlopen("https://api.bybit.com/v5/market/time", timeout=10)
+    if time_response.getcode() == 200:
+        print("✅ Сервер Bybit доступен")
 except Exception as e:
-    print(f"❌ Ошибка: {e}")
-
-# --- 5. Получаем объявления ---
+    print(f"⚠️ Ошибка проверки: {e}")
 
 print("\n" + "="*60)
 print("📊 Запрос P2P данных с Bybit...")
 
-# Получаем объявления на покупку USDT (BUY) - продавцы RUB
-buy_orders = get_p2p_orders("BUY", limit=5)
-# Получаем объявления на продажу USDT (SELL) - покупатели RUB
-sell_orders = get_p2p_orders("SELL", limit=5)
+# --- 5. Получаем объявления ---
+
+buy_orders = get_online_ads("BUY", page=1, size=5)
+sell_orders = get_online_ads("SELL", page=1, size=5)
 
 # --- 6. Выводим результаты в нужном формате ---
 
@@ -131,34 +149,52 @@ if buy_orders and sell_orders:
     print("="*60)
     print("📋 ПЕРВЫЕ 5 ОБЪЯВЛЕНИЙ (BUY и SELL):\n")
     
-    # Выводим объявления
     max_orders = min(5, len(buy_orders), len(sell_orders))
     
     for i in range(max_orders):
         buy = buy_orders[i]
         sell = sell_orders[i]
         
-        # Информация из объявлений
+        # Извлекаем данные из объявлений
         buy_price = buy.get("price", "N/A")
         sell_price = sell.get("price", "N/A")
         
-        buy_seller = buy.get("advertiser", {}).get("nickName", "N/A")
-        sell_seller = sell.get("advertiser", {}).get("nickName", "N/A")
+        buy_seller = buy.get("nickName", buy.get("nickname", "N/A"))
+        sell_seller = sell.get("nickName", sell.get("nickname", "N/A"))
         
-        # Сумма в RUB (берем минимальную для примера)
-        buy_min = float(buy.get("minAmount", 0))
-        buy_avg = buy_min
+        # Сумма и USDT
+        buy_min = Decimal(str(buy.get("minAmount", 0)))
+        buy_max = Decimal(str(buy.get("maxAmount", 0)))
+        
+        # Берем среднюю сумму для примера
+        if buy_min > 0 and buy_max > 0:
+            trade_amount = (buy_min + buy_max) / 2
+        else:
+            trade_amount = buy_min
         
         # Количество USDT
-        if buy_price != "N/A" and float(buy_price) > 0:
-            usdt_amount = buy_avg / float(buy_price)
+        if buy_price != "N/A" and Decimal(str(buy_price)) > 0:
+            usdt_amount = trade_amount / Decimal(str(buy_price))
         else:
-            usdt_amount = 0
+            usdt_amount = Decimal("0")
+        
+        # Форматирование как на скриншоте
+        def fmt(value):
+            if isinstance(value, Decimal):
+                return f"{value:,.2f}".replace(",", " ").replace(".", ",")
+            return str(value).replace(".", ",")
         
         print(f"🏷️  Объявление #{i+1}")
-        print(f"   BUY:  {buy_price} RUB y {buy_seller}")
-        print(f"   SELL: {sell_price} RUB y {sell_seller}")
-        print(f"   Сумма: {buy_avg:.2f} RUB (~{usdt_amount:.2f} USDT)")
+        print(f"   BUY:  {fmt(buy_price)} RUB y {buy_seller}")
+        print(f"   SELL: {fmt(sell_price)} RUB y {sell_seller}")
+        print(f"   Сумма: {fmt(trade_amount)} RUB (~{fmt(usdt_amount)} USDT)")
+        
+        # Дополнительная информация из объявлений
+        buy_methods = buy.get("paymentMethods", [])
+        if buy_methods:
+            methods = [m.get("name", "N/A") for m in buy_methods[:2]]
+            print(f"   Оплата: {', '.join(methods)}")
+        
         print("-" * 40)
     
     print(f"\n✅ Всего получено: {len(buy_orders)} BUY и {len(sell_orders)} SELL объявлений")
@@ -171,7 +207,7 @@ elif buy_orders:
     print("\n📋 BUY объявления:")
     for i, buy in enumerate(buy_orders[:5], 1):
         price = buy.get("price", "N/A")
-        seller = buy.get("advertiser", {}).get("nickName", "N/A")
+        seller = buy.get("nickName", "N/A")
         print(f"   {i}. {price} RUB y {seller}")
     
 elif sell_orders:
@@ -181,7 +217,7 @@ elif sell_orders:
     print("\n📋 SELL объявления:")
     for i, sell in enumerate(sell_orders[:5], 1):
         price = sell.get("price", "N/A")
-        seller = sell.get("advertiser", {}).get("nickName", "N/A")
+        seller = sell.get("nickName", "N/A")
         print(f"   {i}. {price} RUB y {seller}")
     
 else:
