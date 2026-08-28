@@ -1,708 +1,738 @@
 import asyncio
-import logging
+import os
 import re
-from datetime import datetime
+import logging
 from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandStart
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    CallbackQuery,
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-import os
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from dotenv import load_dotenv
 
-# ============== НАСТРОЙКИ ==============
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")  # Если нужен для приватных эндпоинтов
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+# Загрузка переменных окружения
+load_dotenv()
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN не найден в переменных окружения!")
-
-# Логирование
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация бота
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+# Конфигурация
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 
-# ============== ХРАНИЛИЩЕ НАСТРОЕК ПОЛЬЗОВАТЕЛЕЙ ==============
-class UserSettings:
-    def __init__(self):
-        self.blacklist_words: List[str] = []
-        self.whitelist_words: List[str] = []
-        self.min_amount: Optional[float] = None
-        self.max_amount: Optional[float] = None
-        self.exact_amount: Optional[float] = None
-        self.min_spread: float = 1.0  # минимальный спред в %
-        self.payment_methods: List[str] = []
-        self.is_active: bool = True
-        self.last_signal_time: Optional[datetime] = None
-        self.cooldown_seconds: int = 60  # минимальный интервал между сигналами
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN не найден в переменных окружения")
 
-# Словарь для хранения настроек пользователей
-user_settings: Dict[int, UserSettings] = {}
+# URL API Bybit
+BYBIT_P2P_URL = "https://api.bybit.com/v5/market/p2p/orderbook"
 
-def get_user_settings(user_id: int) -> UserSettings:
-    if user_id not in user_settings:
-        user_settings[user_id] = UserSettings()
-    return user_settings[user_id]
+# Хранилище для фильтров пользователей (в реальном проекте использовать БД)
+user_filters: Dict[int, Dict] = {}
+user_subscriptions: Dict[int, bool] = {}
 
-# ============== FSM СОСТОЯНИЯ ==============
+# Состояния FSM для настройки фильтров
 class FilterStates(StatesGroup):
     waiting_for_blacklist = State()
     waiting_for_whitelist = State()
+    waiting_for_exact_amount = State()
     waiting_for_min_amount = State()
     waiting_for_max_amount = State()
-    waiting_for_exact_amount = State()
-    waiting_for_spread = State()
-    waiting_for_payment = State()
+    waiting_for_min_spread = State()
 
-# ============== КЛАВИАТУРЫ ==============
-def get_main_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="📊 Настройки", callback_data="settings"),
-        InlineKeyboardButton(text="🔍 Найти связку сейчас", callback_data="find_now"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="📈 Статистика", callback_data="stats"),
-        InlineKeyboardButton(text="🔄 Обновить данные", callback_data="refresh"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="⏸ Пауза", callback_data="toggle_active"),
-    )
-    return builder.as_markup()
+@dataclass
+class P2POffer:
+    """Класс для хранения данных P2P-объявления"""
+    side: str  # "Buy" или "Sell"
+    price: float
+    amount: float
+    min_amount: float
+    max_amount: float
+    payment_methods: List[str]
+    description: str
+    link: str
+    merchant_name: str
+    is_verified: bool
 
-def get_settings_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="🚫 Черный список", callback_data="set_blacklist"),
-        InlineKeyboardButton(text="✅ Белый список", callback_data="set_whitelist"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="💰 Сумма (мин)", callback_data="set_min_amount"),
-        InlineKeyboardButton(text="💰 Сумма (макс)", callback_data="set_max_amount"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="🎯 Точная сумма", callback_data="set_exact_amount"),
-        InlineKeyboardButton(text="📊 Мин. спред", callback_data="set_spread"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="💳 Платежные системы", callback_data="set_payment"),
-        InlineKeyboardButton(text="🔄 Сбросить все", callback_data="reset_settings"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main"),
-    )
-    return builder.as_markup()
+@dataclass
+class ArbitrageSignal:
+    """Класс для хранения сигнала арбитража"""
+    seller: P2POffer
+    buyer: P2POffer
+    spread: float
+    profit: float
+    timestamp: datetime
 
-# ============== API BYBIT ==============
-class BybitP2PAPI:
-    BASE_URL = "https://api.bybit.com/v5/market/p2p"
+class P2PArbitrageBot:
+    """Основной класс бота для P2P арбитража"""
     
-    @staticmethod
-    async def get_orders(side: str, fiat: str = "RUB", symbol: str = "USDT") -> List[Dict]:
-        """
-        Получение P2P объявлений с Bybit
-        side: 'Sell' или 'Buy'
-        """
-        url = f"{BybitP2PAPI.BASE_URL}/orderbook"
-        params = {
-            "side": side,
-            "fiat": fiat,
-            "symbol": symbol
-        }
+    def __init__(self, bot: Bot):
+        self.bot = bot
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.is_running = False
+        self.monitor_task: Optional[asyncio.Task] = None
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
+    async def start(self):
+        """Запуск бота"""
+        self.session = aiohttp.ClientSession()
+        self.is_running = True
+        self.monitor_task = asyncio.create_task(self._monitor_loop())
+        logger.info("Бот успешно запущен")
         
+    async def stop(self):
+        """Остановка бота"""
+        self.is_running = False
+        if self.monitor_task:
+            self.monitor_task.cancel()
+        if self.session:
+            await self.session.close()
+        logger.info("Бот остановлен")
+    
+    async def _fetch_p2p_offers(self, side: str, fiat: str = "RUB", 
+                                payment_method: Optional[str] = None) -> List[P2POffer]:
+        """Получение P2P-объявлений с Bybit"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, headers=headers, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get("retCode") == 0:
-                            return data.get("result", {}).get("items", [])
-                    logger.error(f"API Error: {response.status}")
+            params = {
+                "side": side,
+                "fiat": fiat,
+                "symbol": "USDT",
+                "page": "1",
+                "size": "50"
+            }
+            if payment_method:
+                params["payment"] = [payment_method]
+                
+            async with self.session.get(BYBIT_P2P_URL, params=params) as response:
+                if response.status != 200:
+                    logger.error(f"Ошибка API Bybit: {response.status}")
                     return []
+                
+                data = await response.json()
+                if data.get("retCode") != 0:
+                    logger.error(f"Ошибка Bybit: {data.get('retMsg')}")
+                    return []
+                
+                offers = []
+                for item in data.get("result", {}).get("items", []):
+                    try:
+                        offer = P2POffer(
+                            side=side,
+                            price=float(item.get("price", 0)),
+                            amount=float(item.get("amount", 0)),
+                            min_amount=float(item.get("minAmount", 0)),
+                            max_amount=float(item.get("maxAmount", 0)),
+                            payment_methods=[p.get("name", "") for p in item.get("payment", [])],
+                            description=item.get("description", ""),
+                            link=item.get("link", ""),
+                            merchant_name=item.get("merchant", {}).get("name", "Аноним"),
+                            is_verified=item.get("merchant", {}).get("verified", False)
+                        )
+                        offers.append(offer)
+                    except (ValueError, KeyError) as e:
+                        logger.warning(f"Ошибка парсинга объявления: {e}")
+                        continue
+                
+                return offers
+                
         except Exception as e:
-            logger.error(f"Request error: {e}")
+            logger.error(f"Ошибка при запросе к Bybit: {e}")
             return []
-
-    @staticmethod
-    async def find_arbitrage(
-        user_id: int,
-        settings: UserSettings,
-        fiat: str = "RUB",
-        symbol: str = "USDT"
-    ) -> Optional[Dict]:
+    
+    def _check_offer_conditions(self, offer: P2POffer, filters: Dict) -> Tuple[bool, str]:
         """
-        Поиск арбитражной связки с учетом фильтров пользователя
-        """
-        # Получаем продавцов и покупателей
-        sellers = await BybitP2PAPI.get_orders("Sell", fiat, symbol)
-        buyers = await BybitP2PAPI.get_orders("Buy", fiat, symbol)
+        Проверка условий мейкера для объявления
         
+        Returns:
+            (True, "OK") если проходит, (False, причина) если нет
+        """
+        if not filters:
+            return True, "OK"
+        
+        # Проверка суммы
+        if filters.get("exact_amount"):
+            if offer.amount != filters["exact_amount"]:
+                return False, f"Сумма {offer.amount}₽ ≠ {filters['exact_amount']}₽"
+        
+        if filters.get("min_amount"):
+            if offer.amount < filters["min_amount"]:
+                return False, f"Сумма {offer.amount}₽ < {filters['min_amount']}₽"
+        
+        if filters.get("max_amount"):
+            if offer.amount > filters["max_amount"]:
+                return False, f"Сумма {offer.amount}₽ > {filters['max_amount']}₽"
+        
+        # Проверка текстовых условий
+        description_lower = offer.description.lower()
+        
+        # Черный список (исключаем)
+        for word in filters.get("blacklist", []):
+            if word.lower() in description_lower:
+                return False, f"Найдено запрещенное слово: {word}"
+        
+        # Белый список (требуем)
+        whitelist = filters.get("whitelist", [])
+        if whitelist:
+            found = any(word.lower() in description_lower for word in whitelist)
+            if not found:
+                return False, f"Нет обязательных слов из: {', '.join(whitelist)}"
+        
+        # Проверка платежных систем
+        if filters.get("payment_methods"):
+            offer_methods = [m.lower() for m in offer.payment_methods]
+            required = [m.lower() for m in filters["payment_methods"]]
+            if not any(m in offer_methods for m in required):
+                return False, f"Нет доступных платежных систем: {', '.join(filters['payment_methods'])}"
+        
+        return True, "OK"
+    
+    def _find_arbitrage(self, sellers: List[P2POffer], buyers: List[P2POffer],
+                        user_filters: Dict) -> Optional[ArbitrageSignal]:
+        """Поиск арбитражной связки"""
         if not sellers or not buyers:
             return None
         
-        # Фильтруем по условиям
-        filtered_sellers = await BybitP2PAPI._filter_orders(sellers, settings, "seller")
-        filtered_buyers = await BybitP2PAPI._filter_orders(buyers, settings, "buyer")
+        # Фильтруем продавцов и покупателей по условиям
+        filtered_sellers = []
+        for seller in sellers:
+            passes, reason = self._check_offer_conditions(seller, user_filters)
+            if passes:
+                filtered_sellers.append(seller)
+        
+        filtered_buyers = []
+        for buyer in buyers:
+            passes, reason = self._check_offer_conditions(buyer, user_filters)
+            if passes:
+                filtered_buyers.append(buyer)
         
         if not filtered_sellers or not filtered_buyers:
             return None
         
-        # Находим лучшие цены
-        best_seller = min(filtered_sellers, key=lambda x: float(x.get("price", 0)))
-        best_buyer = max(filtered_buyers, key=lambda x: float(x.get("price", 0)))
+        # Берем лучшего продавца (самый дешевый) и покупателя (самый дорогой)
+        best_seller = min(filtered_sellers, key=lambda x: x.price)
+        best_buyer = max(filtered_buyers, key=lambda x: x.price)
         
-        seller_price = float(best_seller.get("price", 0))
-        buyer_price = float(best_buyer.get("price", 0))
-        
-        if seller_price == 0 or buyer_price <= seller_price:
+        # Проверяем, что продавец дешевле покупателя
+        if best_seller.price >= best_buyer.price:
             return None
         
-        # Считаем спред
-        spread = ((buyer_price / seller_price) - 1) * 100
+        spread = ((best_buyer.price / best_seller.price) - 1) * 100
         
-        if spread < settings.min_spread:
+        # Проверка минимального спреда
+        min_spread = user_filters.get("min_spread", 0.5)
+        if spread < min_spread:
             return None
         
-        # Формируем результат
-        return {
-            "seller_price": seller_price,
-            "buyer_price": buyer_price,
-            "spread": round(spread, 2),
-            "seller_amount": best_seller.get("quantity", "0"),
-            "buyer_amount": best_buyer.get("quantity", "0"),
-            "seller_link": best_seller.get("link", ""),
-            "buyer_link": best_buyer.get("link", ""),
-            "seller_conditions": best_seller.get("description", ""),
-            "buyer_conditions": best_buyer.get("description", ""),
-            "seller_payment": best_seller.get("payment", []),
-            "buyer_payment": best_buyer.get("payment", []),
-            "timestamp": datetime.now()
-        }
-
-    @staticmethod
-    async def _filter_orders(orders: List[Dict], settings: UserSettings, role: str) -> List[Dict]:
-        """
-        Фильтрация объявлений по настройкам пользователя
-        """
-        filtered = []
+        profit = best_buyer.price - best_seller.price
         
-        for order in orders:
+        return ArbitrageSignal(
+            seller=best_seller,
+            buyer=best_buyer,
+            spread=spread,
+            profit=profit,
+            timestamp=datetime.now()
+        )
+    
+    async def _monitor_loop(self):
+        """Основной цикл мониторинга"""
+        while self.is_running:
             try:
-                # Проверка суммы
-                amount = float(order.get("quantity", 0))
-                if settings.exact_amount and amount != settings.exact_amount:
-                    continue
-                if settings.min_amount and amount < settings.min_amount:
-                    continue
-                if settings.max_amount and amount > settings.max_amount:
-                    continue
-                
-                # Проверка текстовых условий
-                description = order.get("description", "").lower()
-                
-                # Черный список
-                if settings.blacklist_words:
-                    if any(word.lower() in description for word in settings.blacklist_words):
+                for user_id, filters in user_filters.items():
+                    if not user_subscriptions.get(user_id, False):
                         continue
-                
-                # Белый список (если задан)
-                if settings.whitelist_words:
-                    if not any(word.lower() in description for word in settings.whitelist_words):
+                    
+                    # Получаем объявления
+                    sellers = await self._fetch_p2p_offers("Sell")
+                    buyers = await self._fetch_p2p_offers("Buy")
+                    
+                    if not sellers or not buyers:
                         continue
+                    
+                    # Ищем арбитраж
+                    signal = self._find_arbitrage(sellers, buyers, filters)
+                    
+                    if signal:
+                        await self._send_signal(user_id, signal)
                 
-                # Проверка платежных систем (если заданы)
-                if settings.payment_methods:
-                    order_payments = [p.get("payment_name", "").lower() for p in order.get("payment", [])]
-                    if not any(payment in order_payments for payment in settings.payment_methods):
-                        continue
+                # Ждем перед следующим циклом
+                await asyncio.sleep(10)  # Каждые 10 секунд
                 
-                filtered.append(order)
-                
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.error(f"Filter error: {e}")
-                continue
+                logger.error(f"Ошибка в цикле мониторинга: {e}")
+                await asyncio.sleep(30)
+    
+    async def _send_signal(self, user_id: int, signal: ArbitrageSignal):
+        """Отправка сигнала пользователю"""
+        message = f"""
+🔥 <b>АРБИТРАЖНЫЙ СИГНАЛ</b> 🔥
+
+<b>🟢 ПРОДАВЕЦ (SELLER)</b>
+• Курс: {signal.seller.price:.2f}₽
+• Сумма: {signal.seller.amount:,.0f}₽
+• Лимиты: {signal.seller.min_amount:,.0f} - {signal.seller.max_amount:,.0f}₽
+• Платежи: {', '.join(signal.seller.payment_methods)}
+• Мерчант: {signal.seller.merchant_name} {'✅' if signal.seller.is_verified else '❌'}
+
+<b>🔴 ПОКУПАТЕЛЬ (BUYER)</b>
+• Курс: {signal.buyer.price:.2f}₽
+• Сумма: {signal.buyer.amount:,.0f}₽
+• Лимиты: {signal.buyer.min_amount:,.0f} - {signal.buyer.max_amount:,.0f}₽
+• Платежи: {', '.join(signal.buyer.payment_methods)}
+• Мерчант: {signal.buyer.merchant_name} {'✅' if signal.buyer.is_verified else '❌'}
+
+<b>📊 РАСЧЕТ</b>
+• Спред: <b>{signal.spread:.2f}%</b>
+• Прибыль с 1 USDT: {signal.profit:.2f}₽
+
+<b>🔗 Ссылки:</b>
+Продавец: {signal.seller.link}
+Покупатель: {signal.buyer.link}
+
+⏰ {signal.timestamp.strftime('%H:%M:%S')}
+        """
         
-        return filtered
+        try:
+            await self.bot.send_message(
+                user_id,
+                message,
+                parse_mode="HTML"
+            )
+            logger.info(f"Сигнал отправлен пользователю {user_id}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки сигнала: {e}")
+    
+    async def get_filter_settings(self, user_id: int) -> str:
+        """Получение текущих настроек фильтров"""
+        filters = user_filters.get(user_id, {})
+        if not filters:
+            return "🔧 Фильтры не настроены. Используйте /settings для настройки."
+        
+        settings = []
+        settings.append("📋 <b>Текущие настройки фильтров:</b>")
+        
+        if filters.get("exact_amount"):
+            settings.append(f"• Точная сумма: {filters['exact_amount']}₽")
+        if filters.get("min_amount"):
+            settings.append(f"• Мин. сумма: {filters['min_amount']}₽")
+        if filters.get("max_amount"):
+            settings.append(f"• Макс. сумма: {filters['max_amount']}₽")
+        if filters.get("min_spread"):
+            settings.append(f"• Мин. спред: {filters['min_spread']}%")
+        if filters.get("blacklist"):
+            settings.append(f"• Черный список: {', '.join(filters['blacklist'])}")
+        if filters.get("whitelist"):
+            settings.append(f"• Белый список: {', '.join(filters['whitelist'])}")
+        if filters.get("payment_methods"):
+            settings.append(f"• Платежные системы: {', '.join(filters['payment_methods'])}")
+        
+        return "\n".join(settings)
 
-# ============== ФОРМАТИРОВАНИЕ СООБЩЕНИЙ ==============
-def format_signal(signal: Dict) -> str:
-    """Форматирование сигнала в красивое сообщение"""
-    msg = f"🚀 <b>АРБИТРАЖНЫЙ СИГНАЛ</b> 🚀\n\n"
-    msg += f"📊 <b>Спред:</b> {signal['spread']}%\n"
-    msg += f"💰 <b>Сумма:</b> ~{signal['seller_amount']} USDT\n\n"
-    
-    msg += f"🟢 <b>SELLER</b>\n"
-    msg += f"💵 Курс: <b>{signal['seller_price']} ₽</b>\n"
-    msg += f"💳 Платеж: {', '.join(signal.get('seller_payment', ['Не указано']))}\n"
-    if signal.get('seller_conditions'):
-        msg += f"📝 Условия: {signal['seller_conditions'][:100]}...\n"
-    msg += f"🔗 {signal['seller_link']}\n\n"
-    
-    msg += f"🔴 <b>BUYER</b>\n"
-    msg += f"💵 Курс: <b>{signal['buyer_price']} ₽</b>\n"
-    msg += f"💳 Платеж: {', '.join(signal.get('buyer_payment', ['Не указано']))}\n"
-    if signal.get('buyer_conditions'):
-        msg += f"📝 Условия: {signal['buyer_conditions'][:100]}...\n"
-    msg += f"🔗 {signal['buyer_link']}\n\n"
-    
-    msg += f"⏰ {signal['timestamp'].strftime('%H:%M')}\n"
-    msg += f"📈 Потенциальная прибыль: ~{signal['spread'] * 0.95:.2f}% (с учетом комиссий)"
-    
-    return msg
 
-# ============== КОМАНДЫ БОТА ==============
-@dp.message(CommandStart())
+# Инициализация бота и диспетчера
+bot = Bot(token=TELEGRAM_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+arbitrage_bot = P2PArbitrageBot(bot)
+
+# --- Обработчики команд ---
+
+@dp.message(Command("start"))
 async def cmd_start(message: Message):
-    """Обработчик команды /start"""
-    user_id = message.from_user.id
-    settings = get_user_settings(user_id)
-    settings.is_active = True
+    """Команда /start"""
+    welcome_text = """
+🚀 <b>Добро пожаловать в P2P Арбитраж Бот!</b>
+
+Я ищу арбитражные связки на Bybit P2P и присылаю тебе сигналы.
+
+<b>Доступные команды:</b>
+/start - Показать это сообщение
+/settings - Настройка фильтров
+/status - Статус мониторинга
+/start_monitoring - Запустить мониторинг
+/stop_monitoring - Остановить мониторинг
+/clear_filters - Очистить все фильтры
+/help - Помощь
+
+<b>Как это работает:</b>
+1. Настрой фильтры через /settings
+2. Запусти мониторинг /start_monitoring
+3. Бот будет искать выгодные связки
+4. При найденной связке получишь сигнал
+    """
+    await message.answer(welcome_text, parse_mode="HTML")
     
-    welcome_text = (
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        f"Я бот для поиска P2P арбитражных связок на Bybit.\n\n"
-        f"🔍 Я ищу разницу между ценой покупки и продажи USDT\n"
-        f"📊 Учитываю твои фильтры (сумма, платежки, условия)\n"
-        f"⚡️ Отправляю сигналы с высоким спредом\n\n"
-        f"Настрой бота под себя и начни зарабатывать!"
-    )
-    
-    await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+    # Создаем фильтры для пользователя
+    if message.from_user.id not in user_filters:
+        user_filters[message.from_user.id] = {}
+        user_subscriptions[message.from_user.id] = False
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    """Команда /help"""
+    help_text = """
+📖 <b>Помощь по фильтрам</b>
+
+<b>Что можно настраивать:</b>
+
+1. <b>Сумма сделки</b>
+   • /set_exact 28000 - строго 28 000 ₽
+   • /set_min 25000 - минимум 25 000 ₽
+   • /set_max 30000 - максимум 30 000 ₽
+
+2. <b>Текстовые условия</b>
+   • /add_blacklist СБП - исключить объявления с "СБП"
+   • /add_whitelist Т-Банк - искать только с "Т-Банк"
+   • /remove_blacklist СБП - убрать из черного списка
+   • /remove_whitelist Т-Банк - убрать из белого списка
+
+3. <b>Платежные системы</b>
+   • /add_payment Т-Банк - добавить платежную систему
+   • /remove_payment Т-Банк - убрать платежную систему
+
+4. <b>Спред</b>
+   • /set_spread 0.5 - минимальный спред 0.5%
+
+5. <b>Управление</b>
+   • /start_monitoring - запуск поиска
+   • /stop_monitoring - остановка поиска
+   • /status - текущий статус
+   • /clear_filters - очистить все фильтры
+
+<b>Пример:</b>
+1. /set_exact 28000
+2. /add_blacklist СБП
+3. /add_whitelist Т-Банк
+4. /set_spread 0.5
+5. /start_monitoring
+    """
+    await message.answer(help_text, parse_mode="HTML")
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
-    """Показать настройки"""
-    await show_settings(message)
+    """Показать текущие настройки"""
+    settings_text = await arbitrage_bot.get_filter_settings(message.from_user.id)
+    await message.answer(settings_text, parse_mode="HTML")
 
-@dp.callback_query(F.data == "settings")
-async def callback_settings(callback: CallbackQuery):
-    await callback.answer()
-    await show_settings(callback.message)
-
-async def show_settings(message: Message):
-    """Отображение текущих настроек"""
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    """Статус мониторинга"""
     user_id = message.from_user.id
-    settings = get_user_settings(user_id)
+    is_active = user_subscriptions.get(user_id, False)
+    status_emoji = "🟢" if is_active else "🔴"
+    status_text = "Активен" if is_active else "Остановлен"
     
-    text = (
-        "⚙️ <b>ТЕКУЩИЕ НАСТРОЙКИ</b>\n\n"
-        f"🚫 Черный список: {', '.join(settings.blacklist_words) if settings.blacklist_words else 'Не задан'}\n"
-        f"✅ Белый список: {', '.join(settings.whitelist_words) if settings.whitelist_words else 'Не задан'}\n"
-        f"💰 Мин. сумма: {settings.min_amount if settings.min_amount else 'Не ограничена'}\n"
-        f"💰 Макс. сумма: {settings.max_amount if settings.max_amount else 'Не ограничена'}\n"
-        f"🎯 Точная сумма: {settings.exact_amount if settings.exact_amount else 'Не задана'}\n"
-        f"📊 Мин. спред: {settings.min_spread}%\n"
-        f"💳 Платежки: {', '.join(settings.payment_methods) if settings.payment_methods else 'Все'}\n"
-        f"⏸ Статус: {'🟢 Активен' if settings.is_active else '🔴 Приостановлен'}\n"
-    )
+    settings_preview = await arbitrage_bot.get_filter_settings(user_id)
     
-    await message.answer(text, reply_markup=get_settings_keyboard(), parse_mode="HTML")
-
-@dp.callback_query(F.data == "back_to_main")
-async def callback_back_to_main(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.delete()
-    await callback.message.answer("Главное меню", reply_markup=get_main_keyboard())
-
-@dp.callback_query(F.data == "find_now")
-async def callback_find_now(callback: CallbackQuery):
-    await callback.answer("🔍 Ищу связку...")
-    await find_arbitrage_now(callback.message)
-
-@dp.message(Command("find"))
-async def cmd_find(message: Message):
-    await find_arbitrage_now(message)
-
-async def find_arbitrage_now(message: Message):
-    """Поиск арбитража прямо сейчас"""
-    user_id = message.from_user.id
-    settings = get_user_settings(user_id)
-    
-    if not settings.is_active:
-        await message.answer("⚠️ Бот приостановлен. Включи в настройках.")
-        return
-    
-    await message.answer("⏳ Ищу арбитражную связку... Пожалуйста, подожди.")
-    
-    try:
-        signal = await BybitP2PAPI.find_arbitrage(user_id, settings)
-        
-        if signal:
-            formatted_msg = format_signal(signal)
-            await message.answer(formatted_msg, parse_mode="HTML")
-            
-            # Сохраняем время последнего сигнала
-            settings.last_signal_time = datetime.now()
-        else:
-            await message.answer(
-                "❌ Связка не найдена.\n\n"
-                "Попробуй:\n"
-                "• Уменьшить минимальный спред\n"
-                "• Расширить фильтры (сумма, платежки)\n"
-                "• Убрать часть условий"
-            )
-    except Exception as e:
-        logger.error(f"Find error: {e}")
-        await message.answer(f"❌ Ошибка поиска: {str(e)}")
-
-# ============== НАСТРОЙКА ФИЛЬТРОВ ==============
-@dp.callback_query(F.data == "set_blacklist")
-async def callback_set_blacklist(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await callback.message.answer(
-        "🚫 Введите слова для черного списка через запятую\n"
-        "Пример: СБП, Сбер, ВТБ\n\n"
-        "Эти слова будут исключать объявления\n"
-        "Для отмены отправьте /cancel"
-    )
-    await state.set_state(FilterStates.waiting_for_blacklist)
-
-@dp.message(FilterStates.waiting_for_blacklist)
-async def process_blacklist(message: Message, state: FSMContext):
-    if message.text.lower() == "/cancel":
-        await state.clear()
-        await message.answer("❌ Отменено")
-        return
-    
-    user_id = message.from_user.id
-    settings = get_user_settings(user_id)
-    
-    words = [w.strip() for w in message.text.split(",") if w.strip()]
-    settings.blacklist_words = words
-    
-    await state.clear()
     await message.answer(
-        f"✅ Черный список обновлен: {', '.join(words) if words else 'Пуст'}",
-        reply_markup=get_settings_keyboard()
+        f"<b>Статус мониторинга:</b> {status_emoji} {status_text}\n\n"
+        f"{settings_preview}",
+        parse_mode="HTML"
     )
 
-@dp.callback_query(F.data == "set_whitelist")
-async def callback_set_whitelist(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await callback.message.answer(
-        "✅ Введите слова для белого списка через запятую\n"
-        "Пример: Т-Банк, Почта, Альфа\n\n"
-        "Объявления без этих слов будут игнорироваться\n"
-        "Для отмены отправьте /cancel"
-    )
-    await state.set_state(FilterStates.waiting_for_whitelist)
-
-@dp.message(FilterStates.waiting_for_whitelist)
-async def process_whitelist(message: Message, state: FSMContext):
-    if message.text.lower() == "/cancel":
-        await state.clear()
-        await message.answer("❌ Отменено")
-        return
-    
+@dp.message(Command("start_monitoring"))
+async def cmd_start_monitoring(message: Message):
+    """Запуск мониторинга"""
     user_id = message.from_user.id
-    settings = get_user_settings(user_id)
+    filters = user_filters.get(user_id, {})
     
-    words = [w.strip() for w in message.text.split(",") if w.strip()]
-    settings.whitelist_words = words
+    if not filters:
+        await message.answer(
+            "⚠️ Сначала настройте фильтры!\n"
+            "Используйте /settings для просмотра и /help для инструкций."
+        )
+        return
     
-    await state.clear()
+    user_subscriptions[user_id] = True
     await message.answer(
-        f"✅ Белый список обновлен: {', '.join(words) if words else 'Пуст'}",
-        reply_markup=get_settings_keyboard()
+        "✅ Мониторинг запущен!\n"
+        "Бот будет присылать сигналы при нахождении выгодных связок.\n"
+        "Для остановки используйте /stop_monitoring"
     )
 
-@dp.callback_query(F.data == "set_min_amount")
-async def callback_set_min_amount(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await callback.message.answer(
-        "💰 Введите минимальную сумму в RUB\n"
-        "Пример: 10000\n\n"
-        "Для отмены отправьте /cancel"
-    )
-    await state.set_state(FilterStates.waiting_for_min_amount)
-
-@dp.message(FilterStates.waiting_for_min_amount)
-async def process_min_amount(message: Message, state: FSMContext):
-    if message.text.lower() == "/cancel":
-        await state.clear()
-        await message.answer("❌ Отменено")
-        return
-    
-    try:
-        amount = float(message.text.replace(" ", ""))
-        if amount <= 0:
-            raise ValueError()
-        
-        user_id = message.from_user.id
-        settings = get_user_settings(user_id)
-        settings.min_amount = amount
-        
-        await state.clear()
-        await message.answer(
-            f"✅ Минимальная сумма: {amount} RUB",
-            reply_markup=get_settings_keyboard()
-        )
-    except ValueError:
-        await message.answer("❌ Некорректная сумма. Введите число больше 0")
-
-@dp.callback_query(F.data == "set_max_amount")
-async def callback_set_max_amount(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await callback.message.answer(
-        "💰 Введите максимальную сумму в RUB\n"
-        "Пример: 50000\n\n"
-        "Для отмены отправьте /cancel"
-    )
-    await state.set_state(FilterStates.waiting_for_max_amount)
-
-@dp.message(FilterStates.waiting_for_max_amount)
-async def process_max_amount(message: Message, state: FSMContext):
-    if message.text.lower() == "/cancel":
-        await state.clear()
-        await message.answer("❌ Отменено")
-        return
-    
-    try:
-        amount = float(message.text.replace(" ", ""))
-        if amount <= 0:
-            raise ValueError()
-        
-        user_id = message.from_user.id
-        settings = get_user_settings(user_id)
-        settings.max_amount = amount
-        
-        await state.clear()
-        await message.answer(
-            f"✅ Максимальная сумма: {amount} RUB",
-            reply_markup=get_settings_keyboard()
-        )
-    except ValueError:
-        await message.answer("❌ Некорректная сумма. Введите число больше 0")
-
-@dp.callback_query(F.data == "set_exact_amount")
-async def callback_set_exact_amount(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await callback.message.answer(
-        "🎯 Введите точную сумму в RUB\n"
-        "Пример: 28000\n\n"
-        "Будут показаны только объявления с этой суммой\n"
-        "Для отмены отправьте /cancel"
-    )
-    await state.set_state(FilterStates.waiting_for_exact_amount)
-
-@dp.message(FilterStates.waiting_for_exact_amount)
-async def process_exact_amount(message: Message, state: FSMContext):
-    if message.text.lower() == "/cancel":
-        await state.clear()
-        await message.answer("❌ Отменено")
-        return
-    
-    try:
-        amount = float(message.text.replace(" ", ""))
-        if amount <= 0:
-            raise ValueError()
-        
-        user_id = message.from_user.id
-        settings = get_user_settings(user_id)
-        settings.exact_amount = amount
-        
-        await state.clear()
-        await message.answer(
-            f"✅ Точная сумма: {amount} RUB",
-            reply_markup=get_settings_keyboard()
-        )
-    except ValueError:
-        await message.answer("❌ Некорректная сумма. Введите число больше 0")
-
-@dp.callback_query(F.data == "set_spread")
-async def callback_set_spread(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await callback.message.answer(
-        "📊 Введите минимальный спред в %\n"
-        "Пример: 1.5\n\n"
-        "Будут показаны только связки с большим спредом\n"
-        "Для отмены отправьте /cancel"
-    )
-    await state.set_state(FilterStates.waiting_for_spread)
-
-@dp.message(FilterStates.waiting_for_spread)
-async def process_spread(message: Message, state: FSMContext):
-    if message.text.lower() == "/cancel":
-        await state.clear()
-        await message.answer("❌ Отменено")
-        return
-    
-    try:
-        spread = float(message.text.replace("%", "").replace(",", "."))
-        if spread <= 0:
-            raise ValueError()
-        
-        user_id = message.from_user.id
-        settings = get_user_settings(user_id)
-        settings.min_spread = spread
-        
-        await state.clear()
-        await message.answer(
-            f"✅ Минимальный спред: {spread}%",
-            reply_markup=get_settings_keyboard()
-        )
-    except ValueError:
-        await message.answer("❌ Некорректное значение. Введите число больше 0")
-
-@dp.callback_query(F.data == "set_payment")
-async def callback_set_payment(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await callback.message.answer(
-        "💳 Введите платежные системы через запятую\n"
-        "Пример: Т-Банк, Сбер, Альфа\n\n"
-        "Будут показаны только объявления с этими платежками\n"
-        "Для отмены отправьте /cancel"
-    )
-    await state.set_state(FilterStates.waiting_for_payment)
-
-@dp.message(FilterStates.waiting_for_payment)
-async def process_payment(message: Message, state: FSMContext):
-    if message.text.lower() == "/cancel":
-        await state.clear()
-        await message.answer("❌ Отменено")
-        return
-    
+@dp.message(Command("stop_monitoring"))
+async def cmd_stop_monitoring(message: Message):
+    """Остановка мониторинга"""
     user_id = message.from_user.id
-    settings = get_user_settings(user_id)
-    
-    payments = [p.strip() for p in message.text.split(",") if p.strip()]
-    settings.payment_methods = payments
-    
-    await state.clear()
-    await message.answer(
-        f"✅ Платежные системы: {', '.join(payments) if payments else 'Все'}",
-        reply_markup=get_settings_keyboard()
-    )
+    user_subscriptions[user_id] = False
+    await message.answer("⏹ Мониторинг остановлен.")
 
-@dp.callback_query(F.data == "reset_settings")
-async def callback_reset_settings(callback: CallbackQuery):
-    await callback.answer()
-    user_id = callback.from_user.id
-    settings = get_user_settings(user_id)
-    
-    settings.blacklist_words = []
-    settings.whitelist_words = []
-    settings.min_amount = None
-    settings.max_amount = None
-    settings.exact_amount = None
-    settings.min_spread = 1.0
-    settings.payment_methods = []
-    
-    await callback.message.answer(
-        "🔄 Все настройки сброшены!",
-        reply_markup=get_settings_keyboard()
-    )
+@dp.message(Command("clear_filters"))
+async def cmd_clear_filters(message: Message):
+    """Очистка всех фильтров"""
+    user_id = message.from_user.id
+    user_filters[user_id] = {}
+    user_subscriptions[user_id] = False
+    await message.answer("🧹 Все фильтры очищены. Мониторинг остановлен.")
 
-@dp.callback_query(F.data == "toggle_active")
-async def callback_toggle_active(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    settings = get_user_settings(user_id)
-    settings.is_active = not settings.is_active
-    
-    status = "🟢 активирован" if settings.is_active else "🔴 приостановлен"
-    await callback.answer(f"Бот {status}")
-    await callback.message.answer(
-        f"✅ Бот {status}",
-        reply_markup=get_main_keyboard()
-    )
+# --- Команды для настройки фильтров ---
 
-@dp.callback_query(F.data == "stats")
-async def callback_stats(callback: CallbackQuery):
-    await callback.answer()
-    user_id = callback.from_user.id
-    settings = get_user_settings(user_id)
-    
-    text = (
-        "📈 <b>СТАТИСТИКА БОТА</b>\n\n"
-        f"🟢 Статус: {'Активен' if settings.is_active else 'Приостановлен'}\n"
-        f"⏰ Последний сигнал: {settings.last_signal_time.strftime('%H:%M:%S') if settings.last_signal_time else 'Нет'}\n"
-        f"📊 Мин. спред: {settings.min_spread}%\n"
-        f"🚫 Слов в черном списке: {len(settings.blacklist_words)}\n"
-        f"✅ Слов в белом списке: {len(settings.whitelist_words)}\n"
-        f"💰 Ограничение суммы: {'Да' if settings.min_amount or settings.max_amount else 'Нет'}\n"
-        f"💳 Платежных систем: {len(settings.payment_methods)}\n"
-    )
-    
-    await callback.message.answer(text, parse_mode="HTML")
-
-@dp.callback_query(F.data == "refresh")
-async def callback_refresh(callback: CallbackQuery):
-    await callback.answer("🔄 Обновление...")
-    await callback.message.answer("✅ Данные обновлены", reply_markup=get_main_keyboard())
-
-# ============== ФОНОВЫЙ МОНИТОРИНГ ==============
-async def background_monitor():
-    """
-    Фоновый процесс для автоматического поиска сигналов
-    """
-    logger.info("Запуск фонового мониторинга...")
-    
-    while True:
-        try:
-            for user_id, settings in user_settings.items():
-                if not settings.is_active:
-                    continue
-                
-                # Проверяем кулдаун
-                if settings.last_signal_time:
-                    delta = (datetime.now() - settings.last_signal_time).total_seconds()
-                    if delta < settings.cooldown_seconds:
-                        continue
-                
-                # Ищем связку
-                signal = await BybitP2PAPI.find_arbitrage(user_id, settings)
-                
-                if signal:
-                    # Отправляем сигнал
-                    try:
-                        await bot.send_message(
-                            user_id,
-                            format_signal(signal),
-                            parse_mode="HTML"
-                        )
-                        settings.last_signal_time = datetime.now()
-                        logger.info(f"Signal sent to user {user_id}")
-                    except Exception as e:
-                        logger.error(f"Send error to {user_id}: {e}")
-                
-                # Небольшая задержка между пользователями
-                await asyncio.sleep(2)
-                
-        except Exception as e:
-            logger.error(f"Monitor error: {e}")
+@dp.message(Command("set_exact"))
+async def cmd_set_exact(message: Message):
+    """Установка точной суммы"""
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("❌ Использование: /set_exact <сумма>\nПример: /set_exact 28000")
+            return
         
-        # Ждем перед следующим циклом
-        await asyncio.sleep(30)  # Проверка каждые 30 секунд
+        amount = float(args[1])
+        if amount <= 0:
+            await message.answer("❌ Сумма должна быть положительной")
+            return
+        
+        user_id = message.from_user.id
+        if user_id not in user_filters:
+            user_filters[user_id] = {}
+        
+        # Очищаем min и max если устанавливаем точную сумму
+        user_filters[user_id].pop("min_amount", None)
+        user_filters[user_id].pop("max_amount", None)
+        user_filters[user_id]["exact_amount"] = amount
+        
+        await message.answer(f"✅ Установлена точная сумма: {amount:,.0f}₽")
+    except ValueError:
+        await message.answer("❌ Введите корректное число")
 
-# ============== ЗАПУСК БОТА ==============
+@dp.message(Command("set_min"))
+async def cmd_set_min(message: Message):
+    """Установка минимальной суммы"""
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("❌ Использование: /set_min <сумма>\nПример: /set_min 25000")
+            return
+        
+        amount = float(args[1])
+        if amount <= 0:
+            await message.answer("❌ Сумма должна быть положительной")
+            return
+        
+        user_id = message.from_user.id
+        if user_id not in user_filters:
+            user_filters[user_id] = {}
+        
+        user_filters[user_id].pop("exact_amount", None)
+        user_filters[user_id]["min_amount"] = amount
+        
+        await message.answer(f"✅ Установлена минимальная сумма: {amount:,.0f}₽")
+    except ValueError:
+        await message.answer("❌ Введите корректное число")
+
+@dp.message(Command("set_max"))
+async def cmd_set_max(message: Message):
+    """Установка максимальной суммы"""
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("❌ Использование: /set_max <сумма>\nПример: /set_max 30000")
+            return
+        
+        amount = float(args[1])
+        if amount <= 0:
+            await message.answer("❌ Сумма должна быть положительной")
+            return
+        
+        user_id = message.from_user.id
+        if user_id not in user_filters:
+            user_filters[user_id] = {}
+        
+        user_filters[user_id].pop("exact_amount", None)
+        user_filters[user_id]["max_amount"] = amount
+        
+        await message.answer(f"✅ Установлена максимальная сумма: {amount:,.0f}₽")
+    except ValueError:
+        await message.answer("❌ Введите корректное число")
+
+@dp.message(Command("set_spread"))
+async def cmd_set_spread(message: Message):
+    """Установка минимального спреда"""
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("❌ Использование: /set_spread <процент>\nПример: /set_spread 0.5")
+            return
+        
+        spread = float(args[1])
+        if spread < 0:
+            await message.answer("❌ Спред должен быть положительным")
+            return
+        
+        user_id = message.from_user.id
+        if user_id not in user_filters:
+            user_filters[user_id] = {}
+        
+        user_filters[user_id]["min_spread"] = spread
+        
+        await message.answer(f"✅ Установлен минимальный спред: {spread}%")
+    except ValueError:
+        await message.answer("❌ Введите корректное число")
+
+@dp.message(Command("add_blacklist"))
+async def cmd_add_blacklist(message: Message):
+    """Добавление слова в черный список"""
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Использование: /add_blacklist <слово>\nПример: /add_blacklist СБП")
+        return
+    
+    word = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters:
+        user_filters[user_id] = {}
+    
+    if "blacklist" not in user_filters[user_id]:
+        user_filters[user_id]["blacklist"] = []
+    
+    if word not in user_filters[user_id]["blacklist"]:
+        user_filters[user_id]["blacklist"].append(word)
+        await message.answer(f"✅ Добавлено в черный список: {word}")
+    else:
+        await message.answer(f"⚠️ Слово '{word}' уже в черном списке")
+
+@dp.message(Command("remove_blacklist"))
+async def cmd_remove_blacklist(message: Message):
+    """Удаление слова из черного списка"""
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Использование: /remove_blacklist <слово>\nПример: /remove_blacklist СБП")
+        return
+    
+    word = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters or "blacklist" not in user_filters[user_id]:
+        await message.answer("⚠️ Черный список пуст")
+        return
+    
+    if word in user_filters[user_id]["blacklist"]:
+        user_filters[user_id]["blacklist"].remove(word)
+        await message.answer(f"✅ Удалено из черного списка: {word}")
+        if not user_filters[user_id]["blacklist"]:
+            del user_filters[user_id]["blacklist"]
+    else:
+        await message.answer(f"⚠️ Слово '{word}' не найдено в черном списке")
+
+@dp.message(Command("add_whitelist"))
+async def cmd_add_whitelist(message: Message):
+    """Добавление слова в белый список"""
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Использование: /add_whitelist <слово>\nПример: /add_whitelist Т-Банк")
+        return
+    
+    word = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters:
+        user_filters[user_id] = {}
+    
+    if "whitelist" not in user_filters[user_id]:
+        user_filters[user_id]["whitelist"] = []
+    
+    if word not in user_filters[user_id]["whitelist"]:
+        user_filters[user_id]["whitelist"].append(word)
+        await message.answer(f"✅ Добавлено в белый список: {word}")
+    else:
+        await message.answer(f"⚠️ Слово '{word}' уже в белом списке")
+
+@dp.message(Command("remove_whitelist"))
+async def cmd_remove_whitelist(message: Message):
+    """Удаление слова из белого списка"""
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Использование: /remove_whitelist <слово>\nПример: /remove_whitelist Т-Банк")
+        return
+    
+    word = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters or "whitelist" not in user_filters[user_id]:
+        await message.answer("⚠️ Белый список пуст")
+        return
+    
+    if word in user_filters[user_id]["whitelist"]:
+        user_filters[user_id]["whitelist"].remove(word)
+        await message.answer(f"✅ Удалено из белого списка: {word}")
+        if not user_filters[user_id]["whitelist"]:
+            del user_filters[user_id]["whitelist"]
+    else:
+        await message.answer(f"⚠️ Слово '{word}' не найдено в белом списке")
+
+@dp.message(Command("add_payment"))
+async def cmd_add_payment(message: Message):
+    """Добавление платежной системы"""
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Использование: /add_payment <система>\nПример: /add_payment Т-Банк")
+        return
+    
+    payment = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters:
+        user_filters[user_id] = {}
+    
+    if "payment_methods" not in user_filters[user_id]:
+        user_filters[user_id]["payment_methods"] = []
+    
+    if payment not in user_filters[user_id]["payment_methods"]:
+        user_filters[user_id]["payment_methods"].append(payment)
+        await message.answer(f"✅ Добавлена платежная система: {payment}")
+    else:
+        await message.answer(f"⚠️ Платежная система '{payment}' уже добавлена")
+
+@dp.message(Command("remove_payment"))
+async def cmd_remove_payment(message: Message):
+    """Удаление платежной системы"""
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("❌ Использование: /remove_payment <система>\nПример: /remove_payment Т-Банк")
+        return
+    
+    payment = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters or "payment_methods" not in user_filters[user_id]:
+        await message.answer("⚠️ Список платежных систем пуст")
+        return
+    
+    if payment in user_filters[user_id]["payment_methods"]:
+        user_filters[user_id]["payment_methods"].remove(payment)
+        await message.answer(f"✅ Удалена платежная система: {payment}")
+        if not user_filters[user_id]["payment_methods"]:
+            del user_filters[user_id]["payment_methods"]
+    else:
+        await message.answer(f"⚠️ Платежная система '{payment}' не найдена")
+
+
+# --- Обработчик запуска ---
+
+@dp.startup()
+async def on_startup():
+    """Действия при запуске бота"""
+    await arbitrage_bot.start()
+    logger.info("Бот запущен и готов к работе!")
+
+@dp.shutdown()
+async def on_shutdown():
+    """Действия при остановке бота"""
+    await arbitrage_bot.stop()
+    logger.info("Бот остановлен")
+
 async def main():
-    """Главная функция запуска"""
-    logger.info("Запуск бота...")
-    
-    # Запускаем фоновый мониторинг
-    asyncio.create_task(background_monitor())
-    
-    # Запускаем поллинг
-    await dp.start_polling(bot)
+    """Главная функция"""
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+    finally:
+        await arbitrage_bot.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
