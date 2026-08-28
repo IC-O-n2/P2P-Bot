@@ -3,7 +3,7 @@ import os
 import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import hmac
 import json
@@ -45,8 +45,8 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 user_filters: Dict[int, Dict] = {}
 user_subscriptions: Dict[int, bool] = {}
 
-# Хранилище для отправленных сигналов (чтобы не дублировать)
-sent_signals: Dict[int, set] = {}
+# Хранилище для отправленных сигналов (с временем)
+sent_signals: Dict[int, Dict[str, datetime]] = {}
 
 @dataclass
 class P2POffer:
@@ -240,7 +240,7 @@ class P2PArbitrageBot:
         if not filters:
             return True, "OK"
         
-        # Проверка суммы - используем max_amount для проверки вхождения в диапазон
+        # Проверка суммы
         if filters.get("exact_amount"):
             if not (offer.min_amount <= filters["exact_amount"] <= offer.max_amount):
                 return False, f"Сумма {filters['exact_amount']:.0f}₽ не входит в лимиты {offer.min_amount:.0f}-{offer.max_amount:.0f}₽"
@@ -282,7 +282,7 @@ class P2PArbitrageBot:
     
     def _find_all_arbitrage_signals(self, sellers: List[P2POffer], buyers: List[P2POffer],
                                      user_filters: Dict) -> List[ArbitrageSignal]:
-        """Находит ВСЕ арбитражные связки, а не только одну"""
+        """Находит ВСЕ арбитражные связки"""
         if not sellers or not buyers:
             return []
         
@@ -310,16 +310,14 @@ class P2PArbitrageBot:
         signals = []
         min_spread = user_filters.get("min_spread", 0.5)
         
-        # Перебираем всех продавцов и покупателей, находим все возможные связки
-        for seller in filtered_sellers[:20]:  # Ограничиваем первыми 20 продавцами
-            for buyer in filtered_buyers[:20]:  # Ограничиваем первыми 20 покупателями
-                # Проверяем, что продавец дешевле покупателя
+        # Перебираем всех продавцов и покупателей
+        for seller in filtered_sellers[:20]:
+            for buyer in filtered_buyers[:20]:
                 if seller.price >= buyer.price:
                     continue
                 
                 spread = ((buyer.price / seller.price) - 1) * 100
                 
-                # Проверка минимального спреда
                 if spread < min_spread:
                     continue
                 
@@ -330,7 +328,6 @@ class P2PArbitrageBot:
                 if max_trade_amount < min_trade_amount:
                     continue
                 
-                # Проверяем ограничения пользователя
                 if user_filters.get("min_amount"):
                     if max_trade_amount < user_filters["min_amount"]:
                         continue
@@ -345,7 +342,6 @@ class P2PArbitrageBot:
                 profit_per_usdt = buyer.price - seller.price
                 total_profit_rub = usdt_amount * profit_per_usdt
                 
-                # Создаем уникальный ID сигнала
                 signal_id = f"{seller.item_id}_{buyer.item_id}"
                 
                 signal = ArbitrageSignal(
@@ -359,10 +355,26 @@ class P2PArbitrageBot:
                 )
                 signals.append(signal)
         
-        # Сортируем сигналы по прибыли (самые выгодные сверху)
         signals.sort(key=lambda x: x.profit_rub, reverse=True)
-        
         return signals
+    
+    def _clean_old_signals(self, user_id: int):
+        """Очищает старые сигналы (старше 5 минут)"""
+        if user_id not in sent_signals:
+            sent_signals[user_id] = {}
+            return
+        
+        now = datetime.now()
+        old_signals = []
+        for signal_id, sent_time in sent_signals[user_id].items():
+            if now - sent_time > timedelta(minutes=5):
+                old_signals.append(signal_id)
+        
+        for signal_id in old_signals:
+            del sent_signals[user_id][signal_id]
+        
+        if old_signals:
+            logger.debug(f"Очищено {len(old_signals)} старых сигналов для пользователя {user_id}")
     
     async def _monitor_loop(self):
         """Основной цикл мониторинга"""
@@ -377,6 +389,9 @@ class P2PArbitrageBot:
                     if not user_subscriptions.get(user_id, False):
                         continue
                     
+                    # Очищаем старые сигналы
+                    self._clean_old_signals(user_id)
+                    
                     # Получаем объявления
                     sellers = await asyncio.get_event_loop().run_in_executor(
                         None, self._fetch_p2p_offers_sync, "SELL"
@@ -386,7 +401,6 @@ class P2PArbitrageBot:
                     )
                     
                     if not sellers or not buyers:
-                        logger.debug("Нет данных для поиска арбитража")
                         continue
                     
                     # Находим ВСЕ сигналы
@@ -396,24 +410,20 @@ class P2PArbitrageBot:
                         logger.info(f"Найдено {len(signals)} сигналов для пользователя {user_id}")
                         
                         if user_id not in sent_signals:
-                            sent_signals[user_id] = set()
+                            sent_signals[user_id] = {}
                         
-                        # Отправляем каждый новый сигнал
+                        # Отправляем каждый новый сигнал с задержкой 4 секунды
                         sent_count = 0
-                        for signal in signals[:20]:  # Ограничиваем 20 сигналами за раз
+                        for signal in signals[:30]:  # Ограничиваем 30 сигналами за раз
                             if signal.signal_id not in sent_signals[user_id]:
                                 await self._send_signal(user_id, signal)
-                                sent_signals[user_id].add(signal.signal_id)
+                                sent_signals[user_id][signal.signal_id] = datetime.now()
                                 sent_count += 1
-                                # Небольшая задержка между отправками, чтобы не спамить
-                                await asyncio.sleep(0.5)
+                                # Задержка 4 секунды между сигналами
+                                await asyncio.sleep(4)
                         
                         if sent_count > 0:
                             logger.info(f"Отправлено {sent_count} новых сигналов пользователю {user_id}")
-                        
-                        # Очищаем старые сигналы (старше 1 часа или больше 500)
-                        if len(sent_signals[user_id]) > 500:
-                            sent_signals[user_id] = set()
                 
                 await asyncio.sleep(15)
                 
@@ -431,11 +441,9 @@ class P2PArbitrageBot:
         seller_payments = ', '.join(signal.seller.payment_methods) if signal.seller.payment_methods else 'Любые'
         buyer_payments = ', '.join(signal.buyer.payment_methods) if signal.buyer.payment_methods else 'Любые'
         
-        # Генерируем ссылки на объявления
         seller_url = self._generate_offer_url(signal.seller.item_id)
         buyer_url = self._generate_offer_url(signal.buyer.item_id)
         
-        # Расчет максимальной суммы сделки
         trade_amount = min(signal.seller.max_amount, signal.buyer.max_amount)
         usdt_amount = trade_amount / signal.seller.price if signal.seller.price > 0 else 0
         
@@ -549,7 +557,7 @@ async def cmd_start(message: Message):
     if message.from_user.id not in user_filters:
         user_filters[message.from_user.id] = {}
         user_subscriptions[message.from_user.id] = False
-        sent_signals[message.from_user.id] = set()
+        sent_signals[message.from_user.id] = {}
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -621,7 +629,7 @@ async def cmd_status(message: Message):
     
     settings_preview = await arbitrage_bot.get_filter_settings(user_id)
     
-    signals_count = len(sent_signals.get(user_id, set()))
+    signals_count = len(sent_signals.get(user_id, {}))
     
     status_message = f"""
 <b>Статус мониторинга:</b> {status_emoji} {status_text}
@@ -645,7 +653,7 @@ async def cmd_start_monitoring(message: Message):
         )
         return
     
-    sent_signals[user_id] = set()
+    sent_signals[user_id] = {}
     
     user_subscriptions[user_id] = True
     await safe_send_message(
@@ -668,7 +676,7 @@ async def cmd_clear_filters(message: Message):
     user_id = message.from_user.id
     user_filters[user_id] = {}
     user_subscriptions[user_id] = False
-    sent_signals[user_id] = set()
+    sent_signals[user_id] = {}
     await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен.")
 
 # --- Команды для настройки фильтров ---
