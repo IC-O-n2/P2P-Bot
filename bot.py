@@ -119,18 +119,7 @@ def get_online_ads(action: str, page: int = 1, size: int = 5) -> list:
     print(f"   ✅ Получено {len(items)} объявлений")
     return items
 
-# --- 4. Функция для создания ссылки на пользователя ---
-
-def get_user_profile_link(user_id: str, nickname: str) -> str:
-    """Создает ссылку на профиль пользователя Bybit"""
-    if user_id:
-        return f"https://www.bybit.com/user/{user_id}"
-    elif nickname:
-        return f"https://www.bybit.com/user/@{nickname}"
-    else:
-        return "N/A"
-
-# --- 5. Проверка соединения ---
+# --- 4. Проверка соединения ---
 
 print("📊 Проверка соединения с Bybit API...")
 
@@ -146,12 +135,12 @@ except Exception as e:
 print("\n" + "="*60)
 print("📊 Запрос P2P данных с Bybit...")
 
-# --- 6. Получаем объявления ---
+# --- 5. Получаем объявления ---
 
 buy_orders = get_online_ads("BUY", page=1, size=5)
 sell_orders = get_online_ads("SELL", page=1, size=5)
 
-# --- 7. Выводим результаты в нужном формате ---
+# --- 6. Выводим результаты в нужном формате ---
 
 print("\n" + "="*60)
 
@@ -172,14 +161,6 @@ if buy_orders and sell_orders:
         
         buy_seller = buy.get("nickName", buy.get("nickname", "N/A"))
         sell_seller = sell.get("nickName", sell.get("nickname", "N/A"))
-        
-        # ID пользователей для ссылок
-        buy_user_id = buy.get("userId", "")
-        sell_user_id = sell.get("userId", "")
-        
-        # Создаем ссылки
-        buy_link = get_user_profile_link(buy_user_id, buy_seller)
-        sell_link = get_user_profile_link(sell_user_id, sell_seller)
         
         # Сумма и USDT
         buy_min = Decimal(str(buy.get("minAmount", 0)))
@@ -205,9 +186,7 @@ if buy_orders and sell_orders:
         
         print(f"🏷️  Объявление #{i+1}")
         print(f"   BUY:  {fmt(buy_price)} RUB y {buy_seller}")
-        print(f"   🔗 Ссылка на BUY: {buy_link}")
         print(f"   SELL: {fmt(sell_price)} RUB y {sell_seller}")
-        print(f"   🔗 Ссылка на SELL: {sell_link}")
         print(f"   Сумма: {fmt(trade_amount)} RUB (~{fmt(usdt_amount)} USDT)")
         
         # Дополнительная информация из объявлений
@@ -229,10 +208,7 @@ elif buy_orders:
     for i, buy in enumerate(buy_orders[:5], 1):
         price = buy.get("price", "N/A")
         seller = buy.get("nickName", "N/A")
-        user_id = buy.get("userId", "")
-        link = get_user_profile_link(user_id, seller)
         print(f"   {i}. {price} RUB y {seller}")
-        print(f"      🔗 {link}")
     
 elif sell_orders:
     print("⚠️ Получены только SELL объявления")
@@ -242,10 +218,7 @@ elif sell_orders:
     for i, sell in enumerate(sell_orders[:5], 1):
         price = sell.get("price", "N/A")
         seller = sell.get("nickName", "N/A")
-        user_id = sell.get("userId", "")
-        link = get_user_profile_link(user_id, seller)
         print(f"   {i}. {price} RUB y {seller}")
-        print(f"      🔗 {link}")
     
 else:
     print("❌ НЕ УДАЛОСЬ ПОЛУЧИТЬ ДАННЫЕ ОТ BYBIT")
@@ -254,5 +227,147 @@ else:
     print("   2. API ключи не имеют прав на P2P запросы")
     print("   3. Проблемы с сетью или API Bybit")
 
-print("\n" + "="*60)
+# --- 7. ДЕТАЛЬНЫЙ ВЫВОД ВСЕЙ ИНФОРМАЦИИ ПО МЕЙКЕРАМ ---
+
+print("\n" + "="*80)
+print("🔍 ПОДРОБНАЯ ИНФОРМАЦИЯ ПО ВСЕМ МЕЙКЕРАМ (MAKERS)")
+print("="*80)
+
+# Функция для безопасного получения значения
+def safe_get(data, *keys, default="N/A"):
+    for key in keys:
+        if isinstance(data, dict):
+            data = data.get(key, default)
+        else:
+            return default
+    return data
+
+# Вывод BUY объявлений
+if buy_orders:
+    print("\n📈 BUY ОБЪЯВЛЕНИЯ (ПОКУПКА USDT ЗА RUB):")
+    print("-"*80)
+    for idx, order in enumerate(buy_orders, 1):
+        print(f"\n🏷️  BUY МЕЙКЕР #{idx}")
+        print("   " + "="*76)
+        
+        # Основная информация
+        print(f"   👤 Nickname: {safe_get(order, 'nickName', default='N/A')}")
+        print(f"   🆔 UID: {safe_get(order, 'uid', default='N/A')}")
+        print(f"   🔑 User ID: {safe_get(order, 'userId', default='N/A')}")
+        print(f"   📧 Email: {safe_get(order, 'email', default='N/A')}")
+        
+        # Цены и суммы
+        print(f"   💰 Цена: {safe_get(order, 'price', default='N/A')} RUB")
+        print(f"   📊 Мин. сумма: {safe_get(order, 'minAmount', default='N/A')} RUB")
+        print(f"   📊 Макс. сумма: {safe_get(order, 'maxAmount', default='N/A')} RUB")
+        print(f"   📦 Количество: {safe_get(order, 'quantity', default='N/A')} USDT")
+        
+        # Статистика мейкера
+        print(f"   ⭐ Рейтинг: {safe_get(order, 'rating', default='N/A')}")
+        print(f"   📈 Кол-во сделок: {safe_get(order, 'tradeCount', default='N/A')}")
+        print(f"   ⏱️  Время онлайн: {safe_get(order, 'onlineTime', default='N/A')}")
+        
+        # Платежные методы
+        payment_methods = order.get('paymentMethods', [])
+        if payment_methods:
+            print("   💳 Платежные методы:")
+            for pm in payment_methods:
+                print(f"      • {safe_get(pm, 'name', default='N/A')} " +
+                      f"(ID: {safe_get(pm, 'id', default='N/A')})")
+        else:
+            print("   💳 Платежные методы: Не указаны")
+        
+        # Дополнительная информация
+        print(f"   🌐 Страна: {safe_get(order, 'countryCode', default='N/A')}")
+        print(f"   📱 Телефон: {safe_get(order, 'phone', default='N/A')}")
+        print(f"   🏢 Регистрация: {safe_get(order, 'registerTime', default='N/A')}")
+        
+        # Полный JSON для отладки
+        print(f"   📄 Полные данные: {json.dumps(order, ensure_ascii=False, indent=4)}")
+        print("   " + "-"*76)
+
+# Вывод SELL объявлений
+if sell_orders:
+    print("\n📉 SELL ОБЪЯВЛЕНИЯ (ПРОДАЖА USDT ЗА RUB):")
+    print("-"*80)
+    for idx, order in enumerate(sell_orders, 1):
+        print(f"\n🏷️  SELL МЕЙКЕР #{idx}")
+        print("   " + "="*76)
+        
+        # Основная информация
+        print(f"   👤 Nickname: {safe_get(order, 'nickName', default='N/A')}")
+        print(f"   🆔 UID: {safe_get(order, 'uid', default='N/A')}")
+        print(f"   🔑 User ID: {safe_get(order, 'userId', default='N/A')}")
+        print(f"   📧 Email: {safe_get(order, 'email', default='N/A')}")
+        
+        # Цены и суммы
+        print(f"   💰 Цена: {safe_get(order, 'price', default='N/A')} RUB")
+        print(f"   📊 Мин. сумма: {safe_get(order, 'minAmount', default='N/A')} RUB")
+        print(f"   📊 Макс. сумма: {safe_get(order, 'maxAmount', default='N/A')} RUB")
+        print(f"   📦 Количество: {safe_get(order, 'quantity', default='N/A')} USDT")
+        
+        # Статистика мейкера
+        print(f"   ⭐ Рейтинг: {safe_get(order, 'rating', default='N/A')}")
+        print(f"   📈 Кол-во сделок: {safe_get(order, 'tradeCount', default='N/A')}")
+        print(f"   ⏱️  Время онлайн: {safe_get(order, 'onlineTime', default='N/A')}")
+        
+        # Платежные методы
+        payment_methods = order.get('paymentMethods', [])
+        if payment_methods:
+            print("   💳 Платежные методы:")
+            for pm in payment_methods:
+                print(f"      • {safe_get(pm, 'name', default='N/A')} " +
+                      f"(ID: {safe_get(pm, 'id', default='N/A')})")
+        else:
+            print("   💳 Платежные методы: Не указаны")
+        
+        # Дополнительная информация
+        print(f"   🌐 Страна: {safe_get(order, 'countryCode', default='N/A')}")
+        print(f"   📱 Телефон: {safe_get(order, 'phone', default='N/A')}")
+        print(f"   🏢 Регистрация: {safe_get(order, 'registerTime', default='N/A')}")
+        
+        # Полный JSON для отладки
+        print(f"   📄 Полные данные: {json.dumps(order, ensure_ascii=False, indent=4)}")
+        print("   " + "-"*76)
+
+# Сводка по всем мейкерам
+print("\n" + "="*80)
+print("📊 СВОДКА ПО ВСЕМ МЕЙКЕРАМ")
+print("="*80)
+
+all_makers = []
+if buy_orders:
+    for order in buy_orders:
+        all_makers.append({
+            'type': 'BUY',
+            'nickname': safe_get(order, 'nickName'),
+            'uid': safe_get(order, 'uid'),
+            'price': safe_get(order, 'price'),
+            'rating': safe_get(order, 'rating'),
+            'trades': safe_get(order, 'tradeCount')
+        })
+if sell_orders:
+    for order in sell_orders:
+        all_makers.append({
+            'type': 'SELL',
+            'nickname': safe_get(order, 'nickName'),
+            'uid': safe_get(order, 'uid'),
+            'price': safe_get(order, 'price'),
+            'rating': safe_get(order, 'rating'),
+            'trades': safe_get(order, 'tradeCount')
+        })
+
+if all_makers:
+    print(f"\n{'Тип':<6} {'Никнейм':<20} {'UID':<15} {'Цена RUB':<12} {'Рейтинг':<8} {'Сделок':<8}")
+    print("-"*80)
+    for maker in all_makers:
+        print(f"{maker['type']:<6} {maker['nickname']:<20} {maker['uid']:<15} "
+              f"{maker['price']:<12} {maker['rating']:<8} {maker['trades']:<8}")
+    print(f"\n📌 Всего мейкеров: {len(all_makers)}")
+    print(f"   BUY мейкеров: {len(buy_orders) if buy_orders else 0}")
+    print(f"   SELL мейкеров: {len(sell_orders) if sell_orders else 0}")
+else:
+    print("\n❌ Нет данных о мейкерах")
+
+print("\n" + "="*80)
 print("🏁 Завершение работы")
