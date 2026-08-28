@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import logging
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import asyncio
 
@@ -271,7 +271,7 @@ class P2PBot:
         self.finder = P2PArbitrageFinder(self.client)
         self.user_settings = {}  # Хранение настроек пользователей
         
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def start(self, update, context):
         """Обработчик команды /start"""
         keyboard = [
             [InlineKeyboardButton("🔍 Найти связки", callback_data="find_opportunities")],
@@ -291,7 +291,7 @@ class P2PBot:
             reply_markup=reply_markup
         )
     
-    async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def settings(self, update, context):
         """Настройки бота"""
         keyboard = [
             [InlineKeyboardButton("💰 Минимальный спред", callback_data="set_spread")],
@@ -325,7 +325,7 @@ class P2PBot:
                 reply_markup=reply_markup
             )
     
-    async def find_opportunities(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def find_opportunities(self, update, context):
         """Поиск арбитражных связок"""
         user_id = update.effective_user.id
         settings = self.user_settings.get(user_id, {})
@@ -405,7 +405,7 @@ class P2PBot:
                 reply_markup=reply_markup
             )
     
-    async def set_spread(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def set_spread(self, update, context):
         """Установка минимального спреда"""
         await update.callback_query.message.edit_text(
             "💰 *Установка минимального спреда*\n\n"
@@ -415,7 +415,7 @@ class P2PBot:
         await update.callback_query.answer()
         context.user_data['setting'] = 'spread'
     
-    async def set_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def set_amount(self, update, context):
         """Установка диапазона суммы"""
         await update.callback_query.message.edit_text(
             "💵 *Установка диапазона суммы*\n\n"
@@ -425,7 +425,7 @@ class P2PBot:
         await update.callback_query.answer()
         context.user_data['setting'] = 'amount'
     
-    async def set_payments(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def set_payments(self, update, context):
         """Настройка платежных методов"""
         keyboard = [
             [InlineKeyboardButton("✅ СБП", callback_data="pay_14")],
@@ -452,7 +452,7 @@ class P2PBot:
         )
         await update.callback_query.answer()
     
-    async def set_conditions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def set_conditions(self, update, context):
         """Настройка условий мейкера"""
         user_id = update.effective_user.id
         settings = self.user_settings.get(user_id, {})
@@ -480,7 +480,7 @@ class P2PBot:
         )
         await update.callback_query.answer()
     
-    async def handle_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def handle_input(self, update, context):
         """Обработка ввода пользователя"""
         user_id = update.effective_user.id
         setting = context.user_data.get('setting')
@@ -525,7 +525,7 @@ class P2PBot:
         
         context.user_data['setting'] = None
 
-    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def button_handler(self, update, context):
         """Обработчик кнопок"""
         query = update.callback_query
         data = query.data
