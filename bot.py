@@ -1,135 +1,127 @@
 import os
 import requests
 import json
-from datetime import datetime
-import time
-import hashlib
-import hmac
 
 # --- 1. Получение ключей из переменных окружения Railway ---
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 
-if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    print("❌ Ошибка: API ключи не найдены в переменных окружения.")
-    print("   Убедитесь, что BYBIT_API_KEY и BYBIT_API_SECRET установлены в Railway.")
-    exit()
+print("🚀 Запуск P2P мониторинга Bybit...")
+print("="*60)
 
-print("✅ Соединение с Bybit P2P установлено.")
-print("⏳ Запрос первых 5 публичных объявлений (USDT/RUB)...\n")
+# --- 2. Функция для получения объявлений ---
 
-# --- 2. Прямой запрос к P2P API Bybit (без библиотеки pybit) ---
-
-def bybit_p2p_request(api_key, api_secret, endpoint, params):
-    """Выполняет подписанный запрос к P2P API Bybit"""
-    base_url = "https://api.bybit.com"
-    timestamp = str(int(time.time() * 1000))
+def get_p2p_orders(side, coin="USDT", fiat="RUB"):
+    """Получает P2P объявления с Bybit"""
     
-    # Сортировка параметров для подписи
-    sorted_params = sorted(params.items())
-    query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
-    
-    # Создание подписи
-    sign_str = timestamp + api_key + "5000" + query_string
-    signature = hmac.new(
-        bytes(api_secret, "utf-8"),
-        bytes(sign_str, "utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-    
-    # Заголовки
-    headers = {
-        "X-BAPI-API-KEY": api_key,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-SIGN": signature,
-        "X-BAPI-RECV-WINDOW": "5000",
-        "Content-Type": "application/json"
-    }
-    
-    url = base_url + endpoint
-    response = requests.post(url, json=params, headers=headers)
-    return response.json()
-
-# --- 3. Правильный запрос P2P объявлений ---
-
-# Правильные параметры для P2P API
-params = {
-    "coinId": "1",  # ID для USDT
-    "currencyId": "2",  # ID для RUB
-    "side": "0",  # 0 - покупка USDT (продажа RUB), 1 - продажа USDT
-    "page": "1",
-    "size": "5",  # Количество объявлений
-    "paymentMethod": "",  # Пусто для всех методов оплаты
-    "sortType": "1"  # 0 - по умолчанию, 1 - по цене (низкая-высокая)
-}
-
-try:
-    # Пробуем публичный эндпоинт (не требует авторизации)
-    public_params = {
-        "coinId": "1",
-        "currencyId": "2",
-        "side": "0",
+    # Параметры для запроса
+    params = {
+        "coinId": "USDT",
+        "currencyId": "RUB",
+        "side": side,  # "BUY" или "SELL"
         "page": "1",
-        "size": "5",
-        "sortType": "1"
+        "size": "5"
     }
     
-    public_response = requests.post(
-        "https://api.bybit.com/v5/p2p/item/online",
-        json=public_params,
-        headers={"Content-Type": "application/json"}
-    )
-    
-    data = public_response.json()
-    
-    # --- 4. Проверка и вывод ---
-    if data.get("retCode") == 0:
-        items = data.get("result", {}).get("items", [])
+    try:
+        response = requests.post(
+            "https://api.bybit.com/v5/p2p/item/online",
+            json=params,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
         
-        if not items:
-            print("⚠️ Объявлений не найдено.")
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("retCode") == 0:
+                return data.get("result", {}).get("items", [])
+            else:
+                print(f"⚠️ Ошибка API: {data.get('retMsg')}")
+                return []
         else:
-            print(f"📊 Найдено объявлений: {len(items)}")
-            print("--- Первые 5 объявлений (краткий формат) ---\n")
+            print(f"⚠️ HTTP ошибка: {response.status_code}")
+            return []
             
-            for i, ad in enumerate(items[:5], 1):
-                price = ad.get("price", "N/A")
-                min_amount = ad.get("minAmount", "N/A")
-                max_amount = ad.get("maxAmount", "N/A")
-                
-                # Информация о продавце
-                advertiser = ad.get("advertiser", {})
-                user_nick = advertiser.get("nickName", "N/A")
-                
-                # Способы оплаты
-                payment_methods = ad.get("paymentMethods", [])
-                payment_names = []
-                if payment_methods:
-                    for pm in payment_methods[:3]:  # Первые 3 способа
-                        payment_names.append(pm.get("name", "N/A"))
-                payment_names_str = ", ".join(payment_names) if payment_names else "N/A"
-                
-                # Статистика продавца
-                month_orders = advertiser.get("monthOrderCount", "N/A")
-                month_rate = advertiser.get("monthFinishRate", "N/A")
-                
-                print(f"🏷️  Объявление #{i}")
-                print(f"   👤 Продавец: {user_nick}")
-                print(f"   💵 Цена: {price} RUB за USDT")
-                print(f"   💰 Лимиты: {min_amount} - {max_amount} RUB")
-                print(f"   💳 Способы оплаты: {payment_names_str}")
-                print(f"   📊 Заказов за месяц: {month_orders}, выполнено: {month_rate}%")
-                print("-" * 50)
-    
-    else:
-        print(f"❌ Ошибка API: {data.get('retMsg', 'Неизвестная ошибка')}")
-        print(f"   Код: {data.get('retCode')}")
-        print("   Попробуйте другие параметры:")
-        print("   - coinId: 1 (USDT), 2 (BTC), 3 (ETH)")
-        print("   - currencyId: 1 (USD), 2 (RUB), 3 (EUR)")
-        print("   - side: 0 (покупка USDT), 1 (продажа USDT)")
+    except Exception as e:
+        print(f"⚠️ Ошибка запроса: {e}")
+        return []
 
-except requests.exceptions.RequestException as e:
-    print(f"❌ Ошибка подключения: {e}")
-except Exception as e:
-    print(f"❌ Неожиданная ошибка: {e}")
+# --- 3. Получаем объявления на покупку и продажу ---
+
+print("📊 Запрос данных с Bybit P2P...\n")
+
+# Получаем объявления на покупку USDT (BUY) - продавцы RUB
+buy_orders = get_p2p_orders("BUY")
+# Получаем объявления на продажу USDT (SELL) - покупатели RUB
+sell_orders = get_p2p_orders("SELL")
+
+# --- 4. Выводим результаты в формате как на скриншоте ---
+
+if buy_orders and sell_orders:
+    print("✅ УСПЕШНОЕ ПОДКЛЮЧЕНИЕ К BYBIT P2P")
+    print("="*60)
+    print("📋 ПЕРВЫЕ 5 ОБЪЯВЛЕНИЙ (BUY и SELL):\n")
+    
+    # Выводим первые 5 объявлений (или сколько есть)
+    max_orders = min(5, len(buy_orders), len(sell_orders))
+    
+    for i in range(max_orders):
+        buy = buy_orders[i]
+        sell = sell_orders[i]
+        
+        # Цены
+        buy_price = buy.get("price", "N/A")
+        sell_price = sell.get("price", "N/A")
+        
+        # Продавцы/покупатели
+        buy_seller = buy.get("advertiser", {}).get("nickName", "N/A")
+        sell_seller = sell.get("advertiser", {}).get("nickName", "N/A")
+        
+        # Сумма (берем среднюю или минимальную)
+        buy_min = float(buy.get("minAmount", 0))
+        buy_max = float(buy.get("maxAmount", 0))
+        sell_min = float(sell.get("minAmount", 0))
+        sell_max = float(sell.get("maxAmount", 0))
+        
+        # Берем среднюю сумму для примера
+        buy_avg = (buy_min + buy_max) / 2 if buy_min and buy_max else buy_min
+        sell_avg = (sell_min + sell_max) / 2 if sell_min and sell_max else sell_min
+        
+        print(f"🏷️  Объявление #{i+1}")
+        print(f"   BUY: {buy_price} RUB y {buy_seller}")
+        print(f"   SELL: {sell_price} RUB y {sell_seller}")
+        print(f"   Сумма: {buy_avg:.2f} RUB (~{buy_avg/float(buy_price):.2f} USDT)" if buy_price != "N/A" else "   Сумма: N/A")
+        print("-" * 40)
+    
+    print(f"\n✅ Всего получено: {len(buy_orders)} BUY и {len(sell_orders)} SELL объявлений")
+    print("🎯 ДАННЫЕ ОТ BYBIT ПОЛУЧЕНЫ УСПЕШНО!")
+    
+else:
+    print("❌ НЕ УДАЛОСЬ ПОЛУЧИТЬ ДАННЫЕ ОТ BYBIT")
+    print("\n🔍 Пробуем альтернативный запрос...")
+    
+    # Пробуем альтернативные параметры
+    try:
+        alt_params = {
+            "coinId": "1",  # USDT
+            "currencyId": "2",  # RUB
+            "side": "0",  # BUY
+            "page": "1",
+            "size": "5"
+        }
+        
+        response = requests.post(
+            "https://api.bybit.com/v5/p2p/item/online",
+            json=alt_params,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            print(f"📝 Ответ API: {json.dumps(data, indent=2)[:500]}")
+        else:
+            print(f"⚠️ HTTP статус: {response.status_code}")
+            
+    except Exception as e:
+        print(f"⚠️ Ошибка: {e}")
