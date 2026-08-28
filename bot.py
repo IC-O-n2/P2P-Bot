@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime
 import requests
 import html
+import hashlib
+import hmac
+import time
+import json
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Message
@@ -26,11 +30,13 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не найден в переменных окружения")
 
-# URL API Bybit (исправленный)
+# Правильный URL для P2P API Bybit
 BYBIT_P2P_URL = "https://api.bybit.com/v5/market/p2p/orderbook"
 
 # Хранилище для фильтров пользователей
@@ -60,6 +66,229 @@ class ArbitrageSignal:
     profit: float
     timestamp: datetime
 
+class BybitAPI:
+    """Класс для работы с Bybit API с авторизацией"""
+    
+    def __init__(self, api_key: str, api_secret: str):
+        self.api_key = api_key
+        self.api_secret = api_secret
+    
+    def _generate_signature(self, params: Dict, timestamp: int) -> str:
+        """Генерация подписи для запроса"""
+        # Сортируем параметры
+        sorted_params = sorted(params.items())
+        query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
+        
+        # Формируем строку для подписи
+        sign_str = f"{timestamp}{self.api_key}{query_string}"
+        
+        # Генерируем HMAC-SHA256 подпись
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            sign_str.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        
+        return signature
+    
+    def _get_headers(self, params: Dict) -> Dict:
+        """Получение заголовков для запроса"""
+        timestamp = int(time.time() * 1000)
+        signature = self._generate_signature(params, timestamp)
+        
+        return {
+            "X-BAPI-API-KEY": self.api_key,
+            "X-BAPI-TIMESTAMP": str(timestamp),
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-SIGNATURE-TYPE": "2",  # Важно для P2P
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+    
+    def get_p2p_offers(self, side: str, fiat: str = "RUB") -> List[P2POffer]:
+        """Получение P2P-объявлений с Bybit с авторизацией (POST запрос)"""
+        try:
+            # P2P API использует POST с JSON телом
+            params = {
+                "side": side,
+                "fiat": fiat,
+                "symbol": "USDT",
+                "page": "1",
+                "size": "20"  # Уменьшим количество для стабильности
+            }
+            
+            headers = self._get_headers(params)
+            
+            # Используем POST запрос для P2P
+            response = requests.post(
+                BYBIT_P2P_URL,
+                json=params,  # Важно: параметры в теле запроса
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Ошибка API Bybit: {response.status_code}")
+                logger.debug(f"Response: {response.text[:500]}")
+                return []
+            
+            data = response.json()
+            
+            # Проверяем код ответа
+            ret_code = data.get("retCode")
+            if ret_code != 0:
+                logger.error(f"Ошибка Bybit: {data.get('retMsg')} (код: {ret_code})")
+                return []
+            
+            # Проверяем структуру данных
+            result = data.get("result")
+            if not result:
+                logger.warning("Нет данных в ответе от Bybit")
+                return []
+            
+            items = result.get("items", [])
+            if not items:
+                logger.warning(f"Нет объявлений для {side}")
+                return []
+            
+            offers = []
+            for item in items:
+                try:
+                    # Парсим данные с проверкой на существование
+                    price_str = item.get("price", "0")
+                    amount_str = item.get("amount", "0")
+                    min_amount_str = item.get("minAmount", "0")
+                    max_amount_str = item.get("maxAmount", "0")
+                    
+                    # Извлекаем информацию о продавце
+                    merchant = item.get("merchant", {})
+                    merchant_name = merchant.get("name", "Аноним") if merchant else "Аноним"
+                    
+                    # Извлекаем платежные методы
+                    payment_methods = []
+                    for p in item.get("payment", []):
+                        if isinstance(p, dict):
+                            method = p.get("name", "")
+                            if method:
+                                payment_methods.append(method)
+                        elif isinstance(p, str):
+                            payment_methods.append(p)
+                    
+                    offer = P2POffer(
+                        side=side,
+                        price=float(price_str) if price_str else 0,
+                        amount=float(amount_str) if amount_str else 0,
+                        min_amount=float(min_amount_str) if min_amount_str else 0,
+                        max_amount=float(max_amount_str) if max_amount_str else 0,
+                        payment_methods=payment_methods,
+                        description=item.get("description", ""),
+                        link=item.get("link", ""),
+                        merchant_name=merchant_name,
+                        is_verified=merchant.get("verified", False) if merchant else False
+                    )
+                    
+                    # Пропускаем объявления с нулевой ценой
+                    if offer.price > 0:
+                        offers.append(offer)
+                        
+                except (ValueError, KeyError, TypeError) as e:
+                    logger.warning(f"Ошибка парсинга объявления: {e}")
+                    continue
+            
+            logger.info(f"Получено {len(offers)} объявлений для {side}")
+            return offers
+                
+        except requests.exceptions.Timeout:
+            logger.error("Таймаут при запросе к Bybit")
+            return []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Ошибка сети при запросе к Bybit: {e}")
+            return []
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка парсинга JSON от Bybit: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при запросе к Bybit: {e}")
+            return []
+    
+    def get_p2p_offers_public(self, side: str, fiat: str = "RUB") -> List[P2POffer]:
+        """Получение P2P-объявлений с Bybit (публичный запрос - POST)"""
+        try:
+            params = {
+                "side": side,
+                "fiat": fiat,
+                "symbol": "USDT",
+                "page": "1",
+                "size": "20"
+            }
+            
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            
+            # Используем POST запрос для публичного доступа
+            response = requests.post(
+                BYBIT_P2P_URL,
+                json=params,
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Ошибка API Bybit: {response.status_code}")
+                logger.debug(f"Response: {response.text[:500]}")
+                return []
+            
+            data = response.json()
+            
+            if data.get("retCode") != 0:
+                logger.error(f"Ошибка Bybit: {data.get('retMsg')}")
+                return []
+            
+            items = data.get("result", {}).get("items", [])
+            offers = []
+            
+            for item in items:
+                try:
+                    merchant = item.get("merchant", {})
+                    
+                    payment_methods = []
+                    for p in item.get("payment", []):
+                        if isinstance(p, dict):
+                            method = p.get("name", "")
+                            if method:
+                                payment_methods.append(method)
+                        elif isinstance(p, str):
+                            payment_methods.append(p)
+                    
+                    offer = P2POffer(
+                        side=side,
+                        price=float(item.get("price", 0)),
+                        amount=float(item.get("amount", 0)),
+                        min_amount=float(item.get("minAmount", 0)),
+                        max_amount=float(item.get("maxAmount", 0)),
+                        payment_methods=payment_methods,
+                        description=item.get("description", ""),
+                        link=item.get("link", ""),
+                        merchant_name=merchant.get("name", "Аноним") if merchant else "Аноним",
+                        is_verified=merchant.get("verified", False) if merchant else False
+                    )
+                    
+                    if offer.price > 0:
+                        offers.append(offer)
+                        
+                except (ValueError, KeyError) as e:
+                    logger.warning(f"Ошибка парсинга объявления: {e}")
+                    continue
+            
+            logger.info(f"Получено {len(offers)} объявлений для {side} (публичный запрос)")
+            return offers
+                
+        except Exception as e:
+            logger.error(f"Ошибка при публичном запросе к Bybit: {e}")
+            return []
+
 class P2PArbitrageBot:
     """Основной класс бота для P2P арбитража"""
     
@@ -67,9 +296,13 @@ class P2PArbitrageBot:
         self.bot = bot
         self.is_running = False
         self.monitor_task: Optional[asyncio.Task] = None
+        self.bybit_api = BybitAPI(BYBIT_API_KEY, BYBIT_API_SECRET) if BYBIT_API_KEY and BYBIT_API_SECRET else None
         
     async def start(self):
         """Запуск бота"""
+        if not self.bybit_api:
+            logger.warning("Bybit API ключи не настроены! Бот будет работать в публичном режиме.")
+        
         self.is_running = True
         self.monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info("Бот успешно запущен")
@@ -82,66 +315,14 @@ class P2PArbitrageBot:
         logger.info("Бот остановлен")
     
     def _fetch_p2p_offers_sync(self, side: str, fiat: str = "RUB") -> List[P2POffer]:
-        """Получение P2P-объявлений с Bybit (синхронно)"""
-        try:
-            params = {
-                "side": side,
-                "fiat": fiat,
-                "symbol": "USDT",
-                "page": "1",
-                "size": "50"
-            }
-            
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-            
-            response = requests.get(BYBIT_P2P_URL, params=params, headers=headers, timeout=10)
-            
-            if response.status_code != 200:
-                logger.error(f"Ошибка API Bybit: {response.status_code}")
-                logger.debug(f"Response: {response.text[:200]}")
-                return []
-            
-            data = response.json()
-            if data.get("retCode") != 0:
-                logger.error(f"Ошибка Bybit: {data.get('retMsg')}")
-                return []
-            
-            offers = []
-            for item in data.get("result", {}).get("items", []):
-                try:
-                    price_str = item.get("price", "0")
-                    amount_str = item.get("amount", "0")
-                    min_amount_str = item.get("minAmount", "0")
-                    max_amount_str = item.get("maxAmount", "0")
-                    
-                    offer = P2POffer(
-                        side=side,
-                        price=float(price_str) if price_str else 0,
-                        amount=float(amount_str) if amount_str else 0,
-                        min_amount=float(min_amount_str) if min_amount_str else 0,
-                        max_amount=float(max_amount_str) if max_amount_str else 0,
-                        payment_methods=[p.get("name", "") for p in item.get("payment", [])],
-                        description=item.get("description", ""),
-                        link=item.get("link", ""),
-                        merchant_name=item.get("merchant", {}).get("name", "Аноним"),
-                        is_verified=item.get("merchant", {}).get("verified", False)
-                    )
-                    offers.append(offer)
-                except (ValueError, KeyError) as e:
-                    logger.warning(f"Ошибка парсинга объявления: {e}")
-                    continue
-            
-            logger.info(f"Получено {len(offers)} объявлений для {side}")
-            return offers
-                
-        except Exception as e:
-            logger.error(f"Ошибка при запросе к Bybit: {e}")
-            return []
+        """Получение P2P-объявлений с Bybit"""
+        if self.bybit_api:
+            return self.bybit_api.get_p2p_offers(side, fiat)
+        else:
+            return self.bybit_api.get_p2p_offers_public(side, fiat)
     
     def _check_offer_conditions(self, offer: P2POffer, filters: Dict) -> Tuple[bool, str]:
-        """Проверка условий мейкера для объявления"""
+        """Проверка условий для объявления"""
         if not filters:
             return True, "OK"
         
@@ -255,7 +436,7 @@ class P2PArbitrageBot:
                         await self._send_signal(user_id, signal)
                 
                 # Ждем перед следующим циклом
-                await asyncio.sleep(10)
+                await asyncio.sleep(15)  # Увеличим интервал для избежания лимитов
                 
             except asyncio.CancelledError:
                 break
