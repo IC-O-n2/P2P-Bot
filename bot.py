@@ -281,13 +281,13 @@ class P2PArbitrageBot:
         """Генерирует ссылку на профиль пользователя Bybit"""
         if not user_id or user_id == "0" or user_id == "":
             return "Ссылка недоступна"
-        return f"https://www.bybit.com/user/{user_id}"
+        return f"https://www.bybit.com/ru-RU/p2p/profile/{user_id}/USDT/RUB/item"
     
     def _generate_order_url(self, item_id: str) -> str:
         """Генерирует ссылку на ордер Bybit"""
         if not item_id or item_id == "0" or item_id == "":
             return "Ссылка недоступна"
-        return f"https://www.bybit.com/p2p/order/{item_id}"
+        return f"https://www.bybit.com/ru-RU/p2p/order/{item_id}"
     
     def _find_all_arbitrage_signals(self, sellers: List[P2POffer], buyers: List[P2POffer],
                                      user_filters: Dict) -> List[ArbitrageSignal]:
@@ -454,11 +454,11 @@ class P2PArbitrageBot:
         def escape_html(text):
             return html.escape(str(text))
         
-        # Генерируем ссылки на профили
+        # Генерируем ссылки на профили (правильный формат)
         seller_profile_url = self._generate_profile_url(signal.seller.user_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_id)
         
-        # Генерируем ссылки на ордера (на всякий случай)
+        # Генерируем ссылки на ордера
         seller_order_url = self._generate_order_url(signal.seller.item_id)
         buyer_order_url = self._generate_order_url(signal.buyer.item_id)
         
