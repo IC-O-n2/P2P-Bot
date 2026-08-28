@@ -45,6 +45,9 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 user_filters: Dict[int, Dict] = {}
 user_subscriptions: Dict[int, bool] = {}
 
+# Хранилище для отправленных сигналов (чтобы не дублировать)
+sent_signals: Dict[int, set] = {}
+
 @dataclass
 class P2POffer:
     """Класс для хранения данных P2P-объявления"""
@@ -58,6 +61,7 @@ class P2POffer:
     link: str
     merchant_name: str
     is_verified: bool
+    item_id: str  # ID объявления для создания ссылки
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -68,7 +72,9 @@ class ArbitrageSignal:
     buyer: P2POffer
     spread: float
     profit: float
+    profit_rub: float
     timestamp: datetime
+    signal_id: str  # Уникальный ID для предотвращения дублирования
 
 class BybitP2PClient:
     """Клиент для работы с P2P API Bybit"""
@@ -86,7 +92,6 @@ class BybitP2PClient:
         timestamp = str(int(time.time() * 1000))
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         
-        # Строка для подписи: timestamp + api_key + recv_window + body
         signature_payload = f"{timestamp}{self.api_key}{recv_window_ms}{body}"
         
         signature = hmac.new(
@@ -127,15 +132,7 @@ class BybitP2PClient:
             return {}
     
     def get_online_ads(self, side: str, page: int = 1, size: int = 50) -> List[P2POffer]:
-        """
-        Получает P2P объявления с Bybit
-        
-        Args:
-            side: "BUY" или "SELL"
-            page: Номер страницы
-            size: Количество объявлений на странице
-        """
-        # Bybit side: 0 - покупка USDT (продажа RUB), 1 - продажа USDT (покупка RUB)
+        """Получает P2P объявления с Bybit"""
         side_map = {"BUY": 0, "SELL": 1}
         bybit_side = side_map.get(side.upper())
         
@@ -158,22 +155,22 @@ class BybitP2PClient:
         if not items:
             return []
         
-        # Парсим объявления
         offers = []
         for item in items:
             try:
-                # Извлекаем данные
                 price = float(item.get("price", 0))
                 min_amount = float(item.get("minAmount", 0))
                 max_amount = float(item.get("maxAmount", 0))
                 amount = (min_amount + max_amount) / 2 if min_amount > 0 and max_amount > 0 else min_amount
                 
-                # Платежные методы
                 payment_methods = []
                 for method in item.get("paymentMethods", []):
                     name = method.get("name", "")
                     if name:
                         payment_methods.append(name)
+                
+                # Получаем ID объявления
+                item_id = item.get("itemId", "")
                 
                 offer = P2POffer(
                     side=side,
@@ -183,9 +180,10 @@ class BybitP2PClient:
                     max_amount=max_amount,
                     payment_methods=payment_methods,
                     description=item.get("description", ""),
-                    link=item.get("link", ""),
+                    link="",  # Ссылку сгенерируем позже
                     merchant_name=item.get("nickName", "Аноним"),
-                    is_verified=item.get("isVerified", False)
+                    is_verified=item.get("isVerified", False),
+                    item_id=item_id
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
@@ -230,7 +228,6 @@ class P2PArbitrageBot:
             return []
         
         try:
-            # Проверяем соединение с сервером
             if side.upper() == "BUY":
                 return self.bybit_client.get_online_ads("BUY", page=1, size=50)
             else:
@@ -257,15 +254,15 @@ class P2PArbitrageBot:
             if offer.amount > filters["max_amount"]:
                 return False, f"Сумма {offer.amount:.0f}₽ > {filters['max_amount']:.0f}₽"
         
-        # Проверка текстовых условий
+        # Проверка текстовых условий (игнорируем регистр)
         description_lower = offer.description.lower()
         
-        # Черный список (исключаем)
+        # Черный список - исключаем объявления с этими словами
         for word in filters.get("blacklist", []):
             if word.lower() in description_lower:
                 return False, f"Найдено запрещенное слово: {word}"
         
-        # Белый список (требуем)
+        # Белый список - требуем наличие хотя бы одного из этих слов
         whitelist = filters.get("whitelist", [])
         if whitelist:
             found = any(word.lower() in description_lower for word in whitelist)
@@ -280,6 +277,13 @@ class P2PArbitrageBot:
                 return False, f"Нет доступных платежных систем: {', '.join(filters['payment_methods'])}"
         
         return True, "OK"
+    
+    def _generate_offer_url(self, item_id: str) -> str:
+        """Генерирует ссылку на объявление Bybit"""
+        if not item_id:
+            return "Ссылка недоступна"
+        # Формат ссылки для P2P объявления Bybit
+        return f"https://www.bybit.com/p2p/order/{item_id}"
     
     def _find_arbitrage(self, sellers: List[P2POffer], buyers: List[P2POffer],
                         user_filters: Dict) -> Optional[ArbitrageSignal]:
@@ -318,14 +322,40 @@ class P2PArbitrageBot:
         if spread < min_spread:
             return None
         
-        profit = best_buyer.price - best_seller.price
+        # Расчет максимальной прибыли с учетом лимитов
+        max_amount = min(
+            best_seller.max_amount,
+            best_buyer.max_amount,
+            user_filters.get("max_amount", float('inf'))
+        )
+        
+        min_amount = max(
+            best_seller.min_amount,
+            best_buyer.min_amount,
+            user_filters.get("min_amount", 0)
+        )
+        
+        trade_amount = min(max_amount, max_amount)
+        if trade_amount < min_amount:
+            trade_amount = min_amount
+        
+        if trade_amount <= 0:
+            trade_amount = (best_seller.min_amount + best_seller.max_amount) / 2
+        
+        usdt_amount = trade_amount / best_seller.price if best_seller.price > 0 else 0
+        profit_per_usdt = best_buyer.price - best_seller.price
+        total_profit_rub = usdt_amount * profit_per_usdt
+        
+        signal_id = f"{best_seller.merchant_name}_{best_buyer.merchant_name}_{best_seller.price:.2f}_{best_buyer.price:.2f}_{best_seller.item_id}_{best_buyer.item_id}"
         
         return ArbitrageSignal(
             seller=best_seller,
             buyer=best_buyer,
             spread=spread,
-            profit=profit,
-            timestamp=datetime.now()
+            profit=profit_per_usdt,
+            profit_rub=total_profit_rub,
+            timestamp=datetime.now(),
+            signal_id=signal_id
         )
     
     async def _monitor_loop(self):
@@ -357,9 +387,16 @@ class P2PArbitrageBot:
                     signal = self._find_arbitrage(sellers, buyers, filters)
                     
                     if signal:
-                        await self._send_signal(user_id, signal)
+                        if user_id not in sent_signals:
+                            sent_signals[user_id] = set()
+                        
+                        if signal.signal_id not in sent_signals[user_id]:
+                            await self._send_signal(user_id, signal)
+                            sent_signals[user_id].add(signal.signal_id)
+                            
+                            if len(sent_signals[user_id]) > 100:
+                                sent_signals[user_id] = set()
                 
-                # Ждем перед следующим циклом
                 await asyncio.sleep(15)
                 
             except asyncio.CancelledError:
@@ -376,26 +413,34 @@ class P2PArbitrageBot:
         seller_payments = ', '.join(signal.seller.payment_methods) if signal.seller.payment_methods else 'Любые'
         buyer_payments = ', '.join(signal.buyer.payment_methods) if signal.buyer.payment_methods else 'Любые'
         
+        # Генерируем ссылки на объявления
+        seller_url = self._generate_offer_url(signal.seller.item_id)
+        buyer_url = self._generate_offer_url(signal.buyer.item_id)
+        
+        usdt_amount = signal.seller.max_amount / signal.seller.price if signal.seller.price > 0 else 0
+        
         message = f"""
 🔥 <b>АРБИТРАЖНЫЙ СИГНАЛ</b> 🔥
 
-<b>🟢 ПРОДАВЕЦ (SELLER)</b>
+<b>🟢 ПРОДАВЕЦ (SELLER) - у него покупаем USDT</b>
 • Курс: {signal.seller.price:.2f}₽
-• Сумма: {signal.seller.amount:,.0f}₽
 • Лимиты: {signal.seller.min_amount:,.0f} - {signal.seller.max_amount:,.0f}₽
 • Платежи: {escape_html(seller_payments)}
 • Мерчант: {escape_html(signal.seller.merchant_name)} {'✅' if signal.seller.is_verified else '❌'}
+• <a href="{seller_url}">🔗 Ссылка на ордер SELLER</a>
 
-<b>🔴 ПОКУПАТЕЛЬ (BUYER)</b>
+<b>🔴 ПОКУПАТЕЛЬ (BUYER) - ему продаем USDT</b>
 • Курс: {signal.buyer.price:.2f}₽
-• Сумма: {signal.buyer.amount:,.0f}₽
 • Лимиты: {signal.buyer.min_amount:,.0f} - {signal.buyer.max_amount:,.0f}₽
 • Платежи: {escape_html(buyer_payments)}
 • Мерчант: {escape_html(signal.buyer.merchant_name)} {'✅' if signal.buyer.is_verified else '❌'}
+• <a href="{buyer_url}">🔗 Ссылка на ордер BUYER</a>
 
-<b>📊 РАСЧЕТ</b>
+<b>📊 РАСЧЕТ ПРИБЫЛИ</b>
 • Спред: <b>{signal.spread:.2f}%</b>
 • Прибыль с 1 USDT: {signal.profit:.2f}₽
+• Макс. USDT: {usdt_amount:.2f}
+• <b>💰 ПРИБЫЛЬ: {signal.profit_rub:,.2f}₽</b>
 
 ⏰ {signal.timestamp.strftime('%H:%M:%S')}
         """
@@ -404,7 +449,8 @@ class P2PArbitrageBot:
             await self.bot.send_message(
                 user_id,
                 message,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=False
             )
             logger.info(f"Сигнал отправлен пользователю {user_id}")
         except Exception as e:
@@ -414,7 +460,7 @@ class P2PArbitrageBot:
         """Получение текущих настроек фильтров"""
         filters = user_filters.get(user_id, {})
         if not filters:
-            return "🔧 Фильтры не настроены. Используйте /settings для настройки."
+            return "🔧 Фильтры не настроены. Используйте /help для настройки."
         
         settings = []
         settings.append("📋 <b>Текущие настройки фильтров:</b>")
@@ -478,13 +524,14 @@ async def cmd_start(message: Message):
 1. Настрой фильтры через /settings
 2. Запусти мониторинг /start_monitoring
 3. Бот будет искать выгодные связки
-4. При найденной связке получишь сигнал
+4. При найденной связке получишь сигнал со ссылками на ордера
     """
     await safe_send_message(message, welcome_text)
     
     if message.from_user.id not in user_filters:
         user_filters[message.from_user.id] = {}
         user_subscriptions[message.from_user.id] = False
+        sent_signals[message.from_user.id] = set()
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -499,31 +546,44 @@ async def cmd_help(message: Message):
    /set_min 25000 - минимум 25 000 ₽
    /set_max 30000 - максимум 30 000 ₽
 
-2. <b>Текстовые условия</b>
-   /add_blacklist СБП - исключить объявления с "СБП"
-   /add_whitelist Т-Банк - искать только с "Т-Банк"
+2. <b>Черный список (исключаем)</b>
+   /add_blacklist СБП - НЕ показывать объявления со словом "СБП"
    /remove_blacklist СБП - убрать из черного списка
+
+3. <b>Белый список (только эти)</b>
+   /add_whitelist Т-Банк - ПОКАЗЫВАТЬ только объявления со словом "Т-Банк"
    /remove_whitelist Т-Банк - убрать из белого списка
 
-3. <b>Платежные системы</b>
+4. <b>Платежные системы</b>
    /add_payment Т-Банк - добавить платежную систему
    /remove_payment Т-Банк - убрать платежную систему
 
-4. <b>Спред</b>
+5. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
 
-5. <b>Управление</b>
+6. <b>Управление</b>
    /start_monitoring - запуск поиска
    /stop_monitoring - остановка поиска
    /status - текущий статус
    /clear_filters - очистить все фильтры
 
 <b>Пример настройки:</b>
-1. /set_exact 28000
-2. /add_blacklist СБП
-3. /add_whitelist Т-Банк
-4. /set_spread 0.5
-5. /start_monitoring
+1. /set_min 500
+2. /set_max 10000
+3. /set_spread 0.5
+4. /add_blacklist СБП
+5. /add_whitelist Т-Банк
+6. /start_monitoring
+
+<b>Как работают списки:</b>
+• <b>Черный список</b> - запрещает показывать объявления с этими словами
+  Пример: если добавить "СБП", бот пропустит все объявления где есть "СБП"
+
+• <b>Белый список</b> - разрешает показывать ТОЛЬКО объявления с этими словами
+  Пример: если добавить "Т-Банк", бот покажет только объявления с "Т-Банк"
+  
+<b>Важно!</b> Если белый список пуст - бот показывает всё, кроме черного списка.
+Если белый список не пуст - бот показывает ТОЛЬКО то, что есть в белом списке.
     """
     await safe_send_message(message, help_text)
 
@@ -543,8 +603,11 @@ async def cmd_status(message: Message):
     
     settings_preview = await arbitrage_bot.get_filter_settings(user_id)
     
+    signals_count = len(sent_signals.get(user_id, set()))
+    
     status_message = f"""
 <b>Статус мониторинга:</b> {status_emoji} {status_text}
+<b>Отправлено сигналов:</b> {signals_count}
 
 {settings_preview}
     """
@@ -563,6 +626,8 @@ async def cmd_start_monitoring(message: Message):
             "Используйте /settings для просмотра и /help для инструкций."
         )
         return
+    
+    sent_signals[user_id] = set()
     
     user_subscriptions[user_id] = True
     await safe_send_message(
@@ -585,6 +650,7 @@ async def cmd_clear_filters(message: Message):
     user_id = message.from_user.id
     user_filters[user_id] = {}
     user_subscriptions[user_id] = False
+    sent_signals[user_id] = set()
     await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен.")
 
 # --- Команды для настройки фильтров ---
@@ -689,7 +755,12 @@ async def cmd_set_spread(message: Message):
 async def cmd_add_blacklist(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await safe_send_message(message, "❌ Использование: /add_blacklist <слово>\nПример: /add_blacklist СБП")
+        await safe_send_message(
+            message, 
+            "❌ Использование: /add_blacklist <слово>\n"
+            "Пример: /add_blacklist СБП\n\n"
+            "Это исключит все объявления, где есть слово 'СБП'"
+        )
         return
     
     word = args[1]
@@ -702,7 +773,11 @@ async def cmd_add_blacklist(message: Message):
     
     if word not in user_filters[user_id]["blacklist"]:
         user_filters[user_id]["blacklist"].append(word)
-        await safe_send_message(message, f"✅ Добавлено в черный список: {word}")
+        await safe_send_message(
+            message, 
+            f"✅ Добавлено в ЧЕРНЫЙ список: {word}\n"
+            f"Теперь бот НЕ будет показывать объявления с этим словом"
+        )
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' уже в черном списке")
 
@@ -731,7 +806,12 @@ async def cmd_remove_blacklist(message: Message):
 async def cmd_add_whitelist(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await safe_send_message(message, "❌ Использование: /add_whitelist <слово>\nПример: /add_whitelist Т-Банк")
+        await safe_send_message(
+            message,
+            "❌ Использование: /add_whitelist <слово>\n"
+            "Пример: /add_whitelist Т-Банк\n\n"
+            "Теперь бот будет ПОКАЗЫВАТЬ только объявления с этим словом"
+        )
         return
     
     word = args[1]
@@ -744,7 +824,11 @@ async def cmd_add_whitelist(message: Message):
     
     if word not in user_filters[user_id]["whitelist"]:
         user_filters[user_id]["whitelist"].append(word)
-        await safe_send_message(message, f"✅ Добавлено в белый список: {word}")
+        await safe_send_message(
+            message,
+            f"✅ Добавлено в БЕЛЫЙ список: {word}\n"
+            f"Теперь бот будет ПОКАЗЫВАТЬ только объявления с этим словом"
+        )
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' уже в белом списке")
 
