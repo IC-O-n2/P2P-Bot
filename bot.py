@@ -17,19 +17,19 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 print("🚀 Запуск P2P мониторинга Bybit...")
 print("="*60)
 
-# --- 2. Функция для подписанного запроса к Bybit (ПРАВИЛЬНАЯ) ---
+# --- 2. Функция для подписанного POST запроса (согласно примеру) ---
 
-def bybit_signed_request(endpoint, params):
-    """Выполняет подписанный запрос к API Bybit согласно документации"""
+def bybit_signed_post(endpoint, params):
+    """Выполняет подписанный POST запрос к API Bybit"""
     
     base_url = "https://api.bybit.com"
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
     
-    # Для POST запросов подписываем JSON тело
+    # Преобразуем параметры в JSON строку без пробелов
     json_body = json.dumps(params, separators=(',', ':'))
     
-    # Строка для подписи: timestamp + API key + recv_window + jsonBodyString
+    # Строка для подписи: timestamp + api_key + recv_window + jsonBodyString
     sign_str = timestamp + BYBIT_API_KEY + recv_window + json_body
     
     # Создание подписи HMAC-SHA256
@@ -50,13 +50,15 @@ def bybit_signed_request(endpoint, params):
     
     url = base_url + endpoint
     
-    print(f"🔑 Подпись создана для запроса к {endpoint}")
+    # Отладка
+    print(f"   🔑 Подпись: {signature[:20]}...")
+    print(f"   📝 JSON: {json_body}")
     
     try:
         response = requests.post(url, json=params, headers=headers, timeout=10)
         return response.json()
     except Exception as e:
-        print(f"⚠️ Ошибка запроса: {e}")
+        print(f"   ❌ Ошибка запроса: {e}")
         return None
 
 # --- 3. Функция для получения P2P объявлений ---
@@ -73,37 +75,58 @@ def get_p2p_orders(side, coin="USDT", fiat="RUB", limit=5):
         "size": str(limit)
     }
     
-    print(f"📡 Запрос {side} объявлений...")
+    print(f"\n📡 Запрос {side} объявлений...")
     
-    response = bybit_signed_request("/v5/p2p/item/online", params)
+    response = bybit_signed_post("/v5/p2p/item/online", params)
     
     if response:
-        print(f"   Ответ: retCode={response.get('retCode')}, retMsg={response.get('retMsg')}")
+        ret_code = response.get("retCode")
+        ret_msg = response.get("retMsg", "")
         
-        if response.get("retCode") == 0:
+        print(f"   📊 Ответ: retCode={ret_code}, retMsg={ret_msg}")
+        
+        if ret_code == 0 or ret_msg.lower() in ["ok", "success"]:
             items = response.get("result", {}).get("items", [])
             print(f"   ✅ Получено {len(items)} объявлений")
             return items
         else:
-            print(f"   ❌ Ошибка: {response.get('retMsg', 'Неизвестная ошибка')}")
+            print(f"   ❌ Ошибка: {ret_msg}")
             return []
     else:
         print("   ❌ Нет ответа от API")
         return []
 
-# --- 4. Получаем объявления ---
+# --- 4. Проверка соединения с API ---
 
-print("📊 Запрос данных с Bybit P2P...\n")
+print("📊 Проверка соединения с Bybit API...")
 
-# Получаем объявления на покупку USDT (BUY) - люди продают RUB
+try:
+    # Проверяем время сервера
+    time_response = requests.get("https://api.bybit.com/v5/market/time")
+    if time_response.status_code == 200:
+        time_data = time_response.json()
+        print(f"✅ Сервер Bybit доступен")
+        print(f"   Время сервера: {time_data.get('result', {}).get('timeSecond')}")
+    else:
+        print(f"❌ Ошибка доступа: {time_response.status_code}")
+except Exception as e:
+    print(f"❌ Ошибка: {e}")
+
+# --- 5. Получаем объявления ---
+
+print("\n" + "="*60)
+print("📊 Запрос P2P данных с Bybit...")
+
+# Получаем объявления на покупку USDT (BUY) - продавцы RUB
 buy_orders = get_p2p_orders("BUY", limit=5)
-# Получаем объявления на продажу USDT (SELL) - люди покупают RUB
+# Получаем объявления на продажу USDT (SELL) - покупатели RUB
 sell_orders = get_p2p_orders("SELL", limit=5)
 
-# --- 5. Выводим результаты ---
+# --- 6. Выводим результаты в нужном формате ---
+
+print("\n" + "="*60)
 
 if buy_orders and sell_orders:
-    print("\n" + "="*60)
     print("✅ УСПЕШНОЕ ПОДКЛЮЧЕНИЕ К BYBIT P2P")
     print("="*60)
     print("📋 ПЕРВЫЕ 5 ОБЪЯВЛЕНИЙ (BUY и SELL):\n")
@@ -122,10 +145,9 @@ if buy_orders and sell_orders:
         buy_seller = buy.get("advertiser", {}).get("nickName", "N/A")
         sell_seller = sell.get("advertiser", {}).get("nickName", "N/A")
         
-        # Сумма в RUB
+        # Сумма в RUB (берем минимальную для примера)
         buy_min = float(buy.get("minAmount", 0))
-        buy_max = float(buy.get("maxAmount", 0))
-        buy_avg = (buy_min + buy_max) / 2 if buy_min and buy_max else buy_min
+        buy_avg = buy_min
         
         # Количество USDT
         if buy_price != "N/A" and float(buy_price) > 0:
@@ -143,10 +165,9 @@ if buy_orders and sell_orders:
     print("🎯 ДАННЫЕ ОТ BYBIT ПОЛУЧЕНЫ УСПЕШНО!")
     
 elif buy_orders:
-    print("\n⚠️ Получены только BUY объявления, SELL не найдены")
+    print("⚠️ Получены только BUY объявления")
     print(f"   BUY: {len(buy_orders)} объявлений")
     
-    # Покажем что есть
     print("\n📋 BUY объявления:")
     for i, buy in enumerate(buy_orders[:5], 1):
         price = buy.get("price", "N/A")
@@ -154,7 +175,7 @@ elif buy_orders:
         print(f"   {i}. {price} RUB y {seller}")
     
 elif sell_orders:
-    print("\n⚠️ Получены только SELL объявления, BUY не найдены")
+    print("⚠️ Получены только SELL объявления")
     print(f"   SELL: {len(sell_orders)} объявлений")
     
     print("\n📋 SELL объявления:")
@@ -164,17 +185,11 @@ elif sell_orders:
         print(f"   {i}. {price} RUB y {seller}")
     
 else:
-    print("\n❌ НЕ УДАЛОСЬ ПОЛУЧИТЬ ДАННЫЕ ОТ BYBIT")
-    
-    # Попробуем проверить статус API
-    print("\n🔍 Проверка статуса API...")
-    try:
-        time_response = requests.get("https://api.bybit.com/v5/market/time")
-        if time_response.status_code == 200:
-            time_data = time_response.json()
-            print(f"   ✅ Сервер Bybit доступен")
-            print(f"   Время сервера: {time_data.get('result', {}).get('timeSecond')}")
-        else:
-            print(f"   ❌ Ошибка доступа к серверу: {time_response.status_code}")
-    except Exception as e:
-        print(f"   ❌ Ошибка: {e}")
+    print("❌ НЕ УДАЛОСЬ ПОЛУЧИТЬ ДАННЫЕ ОТ BYBIT")
+    print("\n💡 Возможные причины:")
+    print("   1. Нет активных объявлений в паре USDT/RUB")
+    print("   2. API ключи не имеют прав на P2P запросы")
+    print("   3. Проблемы с сетью или API Bybit")
+
+print("\n" + "="*60)
+print("🏁 Завершение работы")
