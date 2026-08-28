@@ -342,7 +342,8 @@ class P2PArbitrageBot:
                 profit_per_usdt = buyer.price - seller.price
                 total_profit_rub = usdt_amount * profit_per_usdt
                 
-                signal_id = f"{seller.item_id}_{buyer.item_id}"
+                # УНИКАЛЬНЫЙ ID на основе всех параметров
+                signal_id = f"{seller.item_id}_{seller.price}_{seller.min_amount}_{seller.max_amount}_{buyer.item_id}_{buyer.price}_{buyer.min_amount}_{buyer.max_amount}"
                 
                 signal = ArbitrageSignal(
                     seller=seller,
@@ -359,7 +360,7 @@ class P2PArbitrageBot:
         return signals
     
     def _clean_old_signals(self, user_id: int):
-        """Очищает старые сигналы (старше 5 минут)"""
+        """Очищает старые сигналы (старше 10 минут)"""
         if user_id not in sent_signals:
             sent_signals[user_id] = {}
             return
@@ -367,7 +368,7 @@ class P2PArbitrageBot:
         now = datetime.now()
         old_signals = []
         for signal_id, sent_time in sent_signals[user_id].items():
-            if now - sent_time > timedelta(minutes=5):
+            if now - sent_time > timedelta(minutes=10):
                 old_signals.append(signal_id)
         
         for signal_id in old_signals:
@@ -414,16 +415,23 @@ class P2PArbitrageBot:
                         
                         # Отправляем каждый новый сигнал с задержкой 4 секунды
                         sent_count = 0
+                        skipped_count = 0
+                        
                         for signal in signals[:30]:  # Ограничиваем 30 сигналами за раз
                             if signal.signal_id not in sent_signals[user_id]:
                                 await self._send_signal(user_id, signal)
                                 sent_signals[user_id][signal.signal_id] = datetime.now()
                                 sent_count += 1
+                                logger.info(f"Отправлен сигнал #{sent_count}: SELL={signal.seller.merchant_name} {signal.seller.price:.2f}₽, BUY={signal.buyer.merchant_name} {signal.buyer.price:.2f}₽, прибыль={signal.profit_rub:.2f}₽")
                                 # Задержка 4 секунды между сигналами
                                 await asyncio.sleep(4)
+                            else:
+                                skipped_count += 1
                         
                         if sent_count > 0:
-                            logger.info(f"Отправлено {sent_count} новых сигналов пользователю {user_id}")
+                            logger.info(f"Отправлено {sent_count} новых сигналов пользователю {user_id} (пропущено {skipped_count} дубликатов)")
+                        else:
+                            logger.info(f"Новых сигналов нет для пользователя {user_id} (все {len(signals)} уже отправлены)")
                 
                 await asyncio.sleep(15)
                 
@@ -653,6 +661,7 @@ async def cmd_start_monitoring(message: Message):
         )
         return
     
+    # Полностью очищаем историю при запуске
     sent_signals[user_id] = {}
     
     user_subscriptions[user_id] = True
