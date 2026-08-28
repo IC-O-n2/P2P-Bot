@@ -446,51 +446,46 @@ class P2PArbitrageBot:
     
     async def _send_signal(self, user_id: int, signal: ArbitrageSignal):
         """Отправка сигнала пользователю"""
-        def escape_html(text):
-            return html.escape(str(text))
-        
-        # Ссылки на профили
-        seller_profile_url = self._generate_profile_url(signal.seller.user_id)
-        buyer_profile_url = self._generate_profile_url(signal.buyer.user_id)
-        
-        # Ссылки на ордера
-        seller_order_url = self._generate_order_url(signal.seller.item_id)
-        buyer_order_url = self._generate_order_url(signal.buyer.item_id)
+        def format_number(num):
+            if num >= 1000:
+                return f"{num:,.0f}".replace(",", " ")
+            return f"{num:.0f}"
         
         trade_amount = min(signal.seller.max_amount, signal.buyer.max_amount)
         usdt_amount = trade_amount / signal.seller.price if signal.seller.price > 0 else 0
         
-        message = f"""
-🔥 <b>АРБИТРАЖНЫЙ СИГНАЛ</b> 🔥
+        # Генерируем ссылки на профили (простой текст, без HTML)
+        seller_profile_url = self._generate_profile_url(signal.seller.user_id)
+        buyer_profile_url = self._generate_profile_url(signal.buyer.user_id)
+        
+        # Формируем сообщение в нужном формате (без HTML ссылок)
+        message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
 
-<b>🟢 ПРОДАВЕЦ (SELLER) - у него покупаем USDT</b>
+🟢 ПРОДАВЕЦ (SELLER)
 • Курс: {signal.seller.price:.2f}₽
-• Лимиты: {signal.seller.min_amount:,.0f} - {signal.seller.max_amount:,.0f}₽
-• Мерчант: {escape_html(signal.seller.merchant_name)} {'✅' if signal.seller.is_verified else '❌'}
-• <a href="{seller_profile_url}">👤 Профиль SELLER</a>
-• <a href="{seller_order_url}">📄 Ордер SELLER</a>
+• Лимиты: {format_number(signal.seller.min_amount)} - {format_number(signal.seller.max_amount)}₽
+• Мерчант: {signal.seller.merchant_name} {'❌' if not signal.seller.is_verified else '✅'}
+{seller_profile_url}
 
-<b>🔴 ПОКУПАТЕЛЬ (BUYER) - ему продаем USDT</b>
+🔴 ПОКУПАТЕЛЬ (BUYER)
 • Курс: {signal.buyer.price:.2f}₽
-• Лимиты: {signal.buyer.min_amount:,.0f} - {signal.buyer.max_amount:,.0f}₽
-• Мерчант: {escape_html(signal.buyer.merchant_name)} {'✅' if signal.buyer.is_verified else '❌'}
-• <a href="{buyer_profile_url}">👤 Профиль BUYER</a>
-• <a href="{buyer_order_url}">📄 Ордер BUYER</a>
+• Лимиты: {format_number(signal.buyer.min_amount)} - {format_number(signal.buyer.max_amount)}₽
+• Мерчант: {signal.buyer.merchant_name} {'❌' if not signal.buyer.is_verified else '✅'}
+{buyer_profile_url}
 
-<b>📊 РАСЧЕТ ПРИБЫЛИ</b>
-• Спред: <b>{signal.spread:.2f}%</b>
+📊 РАСЧЕТ ПРИБЫЛИ
+• Спред: {signal.spread:.2f}%
 • Прибыль с 1 USDT: {signal.profit:.2f}₽
-• Сумма сделки: {trade_amount:,.0f}₽
+• Сумма сделки: {format_number(trade_amount)}₽
 • USDT: {usdt_amount:.2f}
-• <b>💰 ПРИБЫЛЬ: {signal.profit_rub:,.2f}₽</b>
-        """
+• Потенциальная прибыль: {signal.profit_rub:,.2f}₽"""
         
         try:
             await self.bot.send_message(
                 user_id,
                 message,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False
+                parse_mode=None,  # Отключаем HTML парсинг
+                disable_web_page_preview=True  # Отключаем превью ссылок
             )
         except Exception as e:
             logger.error(f"Ошибка отправки сигнала: {e}")
@@ -563,7 +558,7 @@ async def cmd_start(message: Message):
 1. Настрой фильтры через /settings
 2. Запусти мониторинг /start_monitoring
 3. Бот будет искать выгодные связки
-4. При найденной связке получишь сигнал со ссылками на профили и ордера
+4. При найденной связке получишь сигнал со ссылками на профили
     """
     await safe_send_message(message, welcome_text)
     
