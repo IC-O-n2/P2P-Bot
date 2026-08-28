@@ -588,14 +588,10 @@ async def cmd_help(message: Message):
    /add_whitelist Т-Банк - ПОКАЗЫВАТЬ только объявления со словом "Т-Банк"
    /remove_whitelist Т-Банк - убрать из белого списка
 
-4. <b>Платежные системы</b>
-   /add_payment Т-Банк - добавить платежную систему
-   /remove_payment Т-Банк - убрать платежную систему
-
-5. <b>Спред</b>
+4. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
 
-6. <b>Управление</b>
+5. <b>Управление</b>
    /start_monitoring - запуск поиска
    /stop_monitoring - остановка поиска
    /status - текущий статус
@@ -952,3 +948,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
