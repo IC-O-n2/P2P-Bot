@@ -62,6 +62,7 @@ class P2POffer:
     merchant_name: str
     is_verified: bool
     item_id: str
+    user_id: str  # ID пользователя для ссылки на профиль
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -170,6 +171,7 @@ class BybitP2PClient:
                         payment_methods.append(name)
                 
                 item_id = str(item.get("itemId", ""))
+                user_id = str(item.get("uid", ""))  # ID пользователя
                 
                 offer = P2POffer(
                     side=side,
@@ -182,7 +184,8 @@ class BybitP2PClient:
                     link="",
                     merchant_name=item.get("nickName", "Аноним"),
                     is_verified=item.get("isVerified", False),
-                    item_id=item_id
+                    item_id=item_id,
+                    user_id=user_id
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
@@ -274,8 +277,14 @@ class P2PArbitrageBot:
         
         return True, "OK"
     
-    def _generate_offer_url(self, item_id: str) -> str:
-        """Генерирует ссылку на объявление Bybit"""
+    def _generate_profile_url(self, user_id: str) -> str:
+        """Генерирует ссылку на профиль пользователя Bybit"""
+        if not user_id or user_id == "0" or user_id == "":
+            return "Ссылка недоступна"
+        return f"https://www.bybit.com/user/{user_id}"
+    
+    def _generate_order_url(self, item_id: str) -> str:
+        """Генерирует ссылку на ордер Bybit"""
         if not item_id or item_id == "0" or item_id == "":
             return "Ссылка недоступна"
         return f"https://www.bybit.com/p2p/order/{item_id}"
@@ -417,13 +426,12 @@ class P2PArbitrageBot:
                         sent_count = 0
                         skipped_count = 0
                         
-                        for signal in signals[:30]:  # Ограничиваем 30 сигналами за раз
+                        for signal in signals[:30]:
                             if signal.signal_id not in sent_signals[user_id]:
                                 await self._send_signal(user_id, signal)
                                 sent_signals[user_id][signal.signal_id] = datetime.now()
                                 sent_count += 1
                                 logger.info(f"Отправлен сигнал #{sent_count}: SELL={signal.seller.merchant_name} {signal.seller.price:.2f}₽, BUY={signal.buyer.merchant_name} {signal.buyer.price:.2f}₽, прибыль={signal.profit_rub:.2f}₽")
-                                # Задержка 4 секунды между сигналами
                                 await asyncio.sleep(4)
                             else:
                                 skipped_count += 1
@@ -446,11 +454,13 @@ class P2PArbitrageBot:
         def escape_html(text):
             return html.escape(str(text))
         
-        seller_payments = ', '.join(signal.seller.payment_methods) if signal.seller.payment_methods else 'Любые'
-        buyer_payments = ', '.join(signal.buyer.payment_methods) if signal.buyer.payment_methods else 'Любые'
+        # Генерируем ссылки на профили
+        seller_profile_url = self._generate_profile_url(signal.seller.user_id)
+        buyer_profile_url = self._generate_profile_url(signal.buyer.user_id)
         
-        seller_url = self._generate_offer_url(signal.seller.item_id)
-        buyer_url = self._generate_offer_url(signal.buyer.item_id)
+        # Генерируем ссылки на ордера (на всякий случай)
+        seller_order_url = self._generate_order_url(signal.seller.item_id)
+        buyer_order_url = self._generate_order_url(signal.buyer.item_id)
         
         trade_amount = min(signal.seller.max_amount, signal.buyer.max_amount)
         usdt_amount = trade_amount / signal.seller.price if signal.seller.price > 0 else 0
@@ -461,16 +471,16 @@ class P2PArbitrageBot:
 <b>🟢 ПРОДАВЕЦ (SELLER) - у него покупаем USDT</b>
 • Курс: {signal.seller.price:.2f}₽
 • Лимиты: {signal.seller.min_amount:,.0f} - {signal.seller.max_amount:,.0f}₽
-• Платежи: {escape_html(seller_payments)}
 • Мерчант: {escape_html(signal.seller.merchant_name)} {'✅' if signal.seller.is_verified else '❌'}
-• <a href="{seller_url}">🔗 Перейти к ордеру SELLER</a>
+• <a href="{seller_profile_url}">👤 Профиль SELLER</a>
+• <a href="{seller_order_url}">📄 Ордер SELLER</a>
 
 <b>🔴 ПОКУПАТЕЛЬ (BUYER) - ему продаем USDT</b>
 • Курс: {signal.buyer.price:.2f}₽
 • Лимиты: {signal.buyer.min_amount:,.0f} - {signal.buyer.max_amount:,.0f}₽
-• Платежи: {escape_html(buyer_payments)}
 • Мерчант: {escape_html(signal.buyer.merchant_name)} {'✅' if signal.buyer.is_verified else '❌'}
-• <a href="{buyer_url}">🔗 Перейти к ордеру BUYER</a>
+• <a href="{buyer_profile_url}">👤 Профиль BUYER</a>
+• <a href="{buyer_order_url}">📄 Ордер BUYER</a>
 
 <b>📊 РАСЧЕТ ПРИБЫЛИ</b>
 • Спред: <b>{signal.spread:.2f}%</b>
@@ -558,7 +568,7 @@ async def cmd_start(message: Message):
 1. Настрой фильтры через /settings
 2. Запусти мониторинг /start_monitoring
 3. Бот будет искать выгодные связки
-4. При найденной связке получишь сигнал со ссылками на ордера
+4. При найденной связке получишь сигнал со ссылками на профили и ордера
     """
     await safe_send_message(message, welcome_text)
     
@@ -661,7 +671,6 @@ async def cmd_start_monitoring(message: Message):
         )
         return
     
-    # Полностью очищаем историю при запуске
     sent_signals[user_id] = {}
     
     user_subscriptions[user_id] = True
