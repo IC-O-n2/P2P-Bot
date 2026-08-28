@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 import requests
+import html
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Message
@@ -29,7 +30,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не найден в переменных окружения")
 
-# URL API Bybit
+# URL API Bybit (исправленный)
 BYBIT_P2P_URL = "https://api.bybit.com/v5/market/p2p/orderbook"
 
 # Хранилище для фильтров пользователей
@@ -91,10 +92,15 @@ class P2PArbitrageBot:
                 "size": "50"
             }
             
-            response = requests.get(BYBIT_P2P_URL, params=params, timeout=10)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            
+            response = requests.get(BYBIT_P2P_URL, params=params, headers=headers, timeout=10)
             
             if response.status_code != 200:
                 logger.error(f"Ошибка API Bybit: {response.status_code}")
+                logger.debug(f"Response: {response.text[:200]}")
                 return []
             
             data = response.json()
@@ -127,6 +133,7 @@ class P2PArbitrageBot:
                     logger.warning(f"Ошибка парсинга объявления: {e}")
                     continue
             
+            logger.info(f"Получено {len(offers)} объявлений для {side}")
             return offers
                 
         except Exception as e:
@@ -258,6 +265,13 @@ class P2PArbitrageBot:
     
     async def _send_signal(self, user_id: int, signal: ArbitrageSignal):
         """Отправка сигнала пользователю"""
+        # Экранируем специальные символы для HTML
+        def escape_html(text):
+            return html.escape(str(text))
+        
+        seller_payments = ', '.join(signal.seller.payment_methods) if signal.seller.payment_methods else 'Любые'
+        buyer_payments = ', '.join(signal.buyer.payment_methods) if signal.buyer.payment_methods else 'Любые'
+        
         message = f"""
 🔥 <b>АРБИТРАЖНЫЙ СИГНАЛ</b> 🔥
 
@@ -265,23 +279,23 @@ class P2PArbitrageBot:
 • Курс: {signal.seller.price:.2f}₽
 • Сумма: {signal.seller.amount:,.0f}₽
 • Лимиты: {signal.seller.min_amount:,.0f} - {signal.seller.max_amount:,.0f}₽
-• Платежи: {', '.join(signal.seller.payment_methods) if signal.seller.payment_methods else 'Любые'}
-• Мерчант: {signal.seller.merchant_name} {'✅' if signal.seller.is_verified else '❌'}
+• Платежи: {escape_html(seller_payments)}
+• Мерчант: {escape_html(signal.seller.merchant_name)} {'✅' if signal.seller.is_verified else '❌'}
 
 <b>🔴 ПОКУПАТЕЛЬ (BUYER)</b>
 • Курс: {signal.buyer.price:.2f}₽
 • Сумма: {signal.buyer.amount:,.0f}₽
 • Лимиты: {signal.buyer.min_amount:,.0f} - {signal.buyer.max_amount:,.0f}₽
-• Платежи: {', '.join(signal.buyer.payment_methods) if signal.buyer.payment_methods else 'Любые'}
-• Мерчант: {signal.buyer.merchant_name} {'✅' if signal.buyer.is_verified else '❌'}
+• Платежи: {escape_html(buyer_payments)}
+• Мерчант: {escape_html(signal.buyer.merchant_name)} {'✅' if signal.buyer.is_verified else '❌'}
 
 <b>📊 РАСЧЕТ</b>
 • Спред: <b>{signal.spread:.2f}%</b>
 • Прибыль с 1 USDT: {signal.profit:.2f}₽
 
 <b>🔗 Ссылки:</b>
-Продавец: {signal.seller.link if signal.seller.link else 'Нет ссылки'}
-Покупатель: {signal.buyer.link if signal.buyer.link else 'Нет ссылки'}
+Продавец: {escape_html(signal.seller.link) if signal.seller.link else 'Нет ссылки'}
+Покупатель: {escape_html(signal.buyer.link) if signal.buyer.link else 'Нет ссылки'}
 
 ⏰ {signal.timestamp.strftime('%H:%M:%S')}
         """
@@ -332,17 +346,27 @@ bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMod
 dp = Dispatcher()
 arbitrage_bot = P2PArbitrageBot(bot)
 
+# Функция для безопасной отправки сообщений
+async def safe_send_message(message: Message, text: str):
+    """Отправка сообщения с безопасной обработкой HTML"""
+    try:
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        # Если HTML не проходит, отправляем без форматирования
+        logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
+        await message.answer(text.replace('<', '[').replace('>', ']'))
+
 # --- Обработчики команд ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     """Команда /start"""
     welcome_text = """
-🚀 <b>Добро пожаловать в P2P Арбитраж Бот!</b>
+🚀 Добро пожаловать в P2P Арбитраж Бот!
 
 Я ищу арбитражные связки на Bybit P2P и присылаю тебе сигналы.
 
-<b>Доступные команды:</b>
+Доступные команды:
 /start - Показать это сообщение
 /settings - Настройка фильтров
 /status - Статус мониторинга
@@ -351,13 +375,13 @@ async def cmd_start(message: Message):
 /clear_filters - Очистить все фильтры
 /help - Помощь
 
-<b>Как это работает:</b>
+Как это работает:
 1. Настрой фильтры через /settings
 2. Запусти мониторинг /start_monitoring
 3. Бот будет искать выгодные связки
 4. При найденной связке получишь сигнал
     """
-    await message.answer(welcome_text)
+    await safe_send_message(message, welcome_text)
     
     if message.from_user.id not in user_filters:
         user_filters[message.from_user.id] = {}
@@ -367,48 +391,48 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     """Команда /help"""
     help_text = """
-📖 <b>Помощь по фильтрам</b>
+📖 Помощь по фильтрам
 
-<b>Что можно настраивать:</b>
+Что можно настраивать:
 
-1. <b>Сумма сделки</b>
-   • /set_exact 28000 - строго 28 000 ₽
-   • /set_min 25000 - минимум 25 000 ₽
-   • /set_max 30000 - максимум 30 000 ₽
+1. Сумма сделки
+   /set_exact 28000 - строго 28 000 ₽
+   /set_min 25000 - минимум 25 000 ₽
+   /set_max 30000 - максимум 30 000 ₽
 
-2. <b>Текстовые условия</b>
-   • /add_blacklist СБП - исключить объявления с "СБП"
-   • /add_whitelist Т-Банк - искать только с "Т-Банк"
-   • /remove_blacklist СБП - убрать из черного списка
-   • /remove_whitelist Т-Банк - убрать из белого списка
+2. Текстовые условия
+   /add_blacklist СБП - исключить объявления с "СБП"
+   /add_whitelist Т-Банк - искать только с "Т-Банк"
+   /remove_blacklist СБП - убрать из черного списка
+   /remove_whitelist Т-Банк - убрать из белого списка
 
-3. <b>Платежные системы</b>
-   • /add_payment Т-Банк - добавить платежную систему
-   • /remove_payment Т-Банк - убрать платежную систему
+3. Платежные системы
+   /add_payment Т-Банк - добавить платежную систему
+   /remove_payment Т-Банк - убрать платежную систему
 
-4. <b>Спред</b>
-   • /set_spread 0.5 - минимальный спред 0.5%
+4. Спред
+   /set_spread 0.5 - минимальный спред 0.5%
 
-5. <b>Управление</b>
-   • /start_monitoring - запуск поиска
-   • /stop_monitoring - остановка поиска
-   • /status - текущий статус
-   • /clear_filters - очистить все фильтры
+5. Управление
+   /start_monitoring - запуск поиска
+   /stop_monitoring - остановка поиска
+   /status - текущий статус
+   /clear_filters - очистить все фильтры
 
-<b>Пример настройки:</b>
+Пример настройки:
 1. /set_exact 28000
 2. /add_blacklist СБП
 3. /add_whitelist Т-Банк
 4. /set_spread 0.5
 5. /start_monitoring
     """
-    await message.answer(help_text)
+    await safe_send_message(message, help_text)
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
     """Показать текущие настройки"""
     settings_text = await arbitrage_bot.get_filter_settings(message.from_user.id)
-    await message.answer(settings_text)
+    await safe_send_message(message, settings_text)
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
@@ -420,10 +444,12 @@ async def cmd_status(message: Message):
     
     settings_preview = await arbitrage_bot.get_filter_settings(user_id)
     
-    await message.answer(
-        f"<b>Статус мониторинга:</b> {status_emoji} {status_text}\n\n"
-        f"{settings_preview}"
-    )
+    status_message = f"""
+Статус мониторинга: {status_emoji} {status_text}
+
+{settings_preview}
+    """
+    await safe_send_message(message, status_message)
 
 @dp.message(Command("start_monitoring"))
 async def cmd_start_monitoring(message: Message):
@@ -432,14 +458,16 @@ async def cmd_start_monitoring(message: Message):
     filters = user_filters.get(user_id, {})
     
     if not filters:
-        await message.answer(
+        await safe_send_message(
+            message,
             "⚠️ Сначала настройте фильтры!\n"
             "Используйте /settings для просмотра и /help для инструкций."
         )
         return
     
     user_subscriptions[user_id] = True
-    await message.answer(
+    await safe_send_message(
+        message,
         "✅ Мониторинг запущен!\n"
         "Бот будет присылать сигналы при нахождении выгодных связок.\n"
         "Для остановки используйте /stop_monitoring"
@@ -450,7 +478,7 @@ async def cmd_stop_monitoring(message: Message):
     """Остановка мониторинга"""
     user_id = message.from_user.id
     user_subscriptions[user_id] = False
-    await message.answer("⏹ Мониторинг остановлен.")
+    await safe_send_message(message, "⏹ Мониторинг остановлен.")
 
 @dp.message(Command("clear_filters"))
 async def cmd_clear_filters(message: Message):
@@ -458,7 +486,7 @@ async def cmd_clear_filters(message: Message):
     user_id = message.from_user.id
     user_filters[user_id] = {}
     user_subscriptions[user_id] = False
-    await message.answer("🧹 Все фильтры очищены. Мониторинг остановлен.")
+    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен.")
 
 # --- Команды для настройки фильтров ---
 
@@ -467,12 +495,12 @@ async def cmd_set_exact(message: Message):
     try:
         args = message.text.split()
         if len(args) != 2:
-            await message.answer("❌ Использование: /set_exact <сумма>\nПример: /set_exact 28000")
+            await safe_send_message(message, "❌ Использование: /set_exact <сумма>\nПример: /set_exact 28000")
             return
         
         amount = float(args[1])
         if amount <= 0:
-            await message.answer("❌ Сумма должна быть положительной")
+            await safe_send_message(message, "❌ Сумма должна быть положительной")
             return
         
         user_id = message.from_user.id
@@ -483,21 +511,21 @@ async def cmd_set_exact(message: Message):
         user_filters[user_id].pop("max_amount", None)
         user_filters[user_id]["exact_amount"] = amount
         
-        await message.answer(f"✅ Установлена точная сумма: {amount:,.0f}₽")
+        await safe_send_message(message, f"✅ Установлена точная сумма: {amount:,.0f}₽")
     except ValueError:
-        await message.answer("❌ Введите корректное число")
+        await safe_send_message(message, "❌ Введите корректное число")
 
 @dp.message(Command("set_min"))
 async def cmd_set_min(message: Message):
     try:
         args = message.text.split()
         if len(args) != 2:
-            await message.answer("❌ Использование: /set_min <сумма>\nПример: /set_min 25000")
+            await safe_send_message(message, "❌ Использование: /set_min <сумма>\nПример: /set_min 25000")
             return
         
         amount = float(args[1])
         if amount <= 0:
-            await message.answer("❌ Сумма должна быть положительной")
+            await safe_send_message(message, "❌ Сумма должна быть положительной")
             return
         
         user_id = message.from_user.id
@@ -507,21 +535,21 @@ async def cmd_set_min(message: Message):
         user_filters[user_id].pop("exact_amount", None)
         user_filters[user_id]["min_amount"] = amount
         
-        await message.answer(f"✅ Установлена минимальная сумма: {amount:,.0f}₽")
+        await safe_send_message(message, f"✅ Установлена минимальная сумма: {amount:,.0f}₽")
     except ValueError:
-        await message.answer("❌ Введите корректное число")
+        await safe_send_message(message, "❌ Введите корректное число")
 
 @dp.message(Command("set_max"))
 async def cmd_set_max(message: Message):
     try:
         args = message.text.split()
         if len(args) != 2:
-            await message.answer("❌ Использование: /set_max <сумма>\nПример: /set_max 30000")
+            await safe_send_message(message, "❌ Использование: /set_max <сумма>\nПример: /set_max 30000")
             return
         
         amount = float(args[1])
         if amount <= 0:
-            await message.answer("❌ Сумма должна быть положительной")
+            await safe_send_message(message, "❌ Сумма должна быть положительной")
             return
         
         user_id = message.from_user.id
@@ -531,21 +559,21 @@ async def cmd_set_max(message: Message):
         user_filters[user_id].pop("exact_amount", None)
         user_filters[user_id]["max_amount"] = amount
         
-        await message.answer(f"✅ Установлена максимальная сумма: {amount:,.0f}₽")
+        await safe_send_message(message, f"✅ Установлена максимальная сумма: {amount:,.0f}₽")
     except ValueError:
-        await message.answer("❌ Введите корректное число")
+        await safe_send_message(message, "❌ Введите корректное число")
 
 @dp.message(Command("set_spread"))
 async def cmd_set_spread(message: Message):
     try:
         args = message.text.split()
         if len(args) != 2:
-            await message.answer("❌ Использование: /set_spread <процент>\nПример: /set_spread 0.5")
+            await safe_send_message(message, "❌ Использование: /set_spread <процент>\nПример: /set_spread 0.5")
             return
         
         spread = float(args[1])
         if spread < 0:
-            await message.answer("❌ Спред должен быть положительным")
+            await safe_send_message(message, "❌ Спред должен быть положительным")
             return
         
         user_id = message.from_user.id
@@ -554,15 +582,15 @@ async def cmd_set_spread(message: Message):
         
         user_filters[user_id]["min_spread"] = spread
         
-        await message.answer(f"✅ Установлен минимальный спред: {spread}%")
+        await safe_send_message(message, f"✅ Установлен минимальный спред: {spread}%")
     except ValueError:
-        await message.answer("❌ Введите корректное число")
+        await safe_send_message(message, "❌ Введите корректное число")
 
 @dp.message(Command("add_blacklist"))
 async def cmd_add_blacklist(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("❌ Использование: /add_blacklist <слово>\nПример: /add_blacklist СБП")
+        await safe_send_message(message, "❌ Использование: /add_blacklist <слово>\nПример: /add_blacklist СБП")
         return
     
     word = args[1]
@@ -575,36 +603,36 @@ async def cmd_add_blacklist(message: Message):
     
     if word not in user_filters[user_id]["blacklist"]:
         user_filters[user_id]["blacklist"].append(word)
-        await message.answer(f"✅ Добавлено в черный список: {word}")
+        await safe_send_message(message, f"✅ Добавлено в черный список: {word}")
     else:
-        await message.answer(f"⚠️ Слово '{word}' уже в черном списке")
+        await safe_send_message(message, f"⚠️ Слово '{word}' уже в черном списке")
 
 @dp.message(Command("remove_blacklist"))
 async def cmd_remove_blacklist(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("❌ Использование: /remove_blacklist <слово>\nПример: /remove_blacklist СБП")
+        await safe_send_message(message, "❌ Использование: /remove_blacklist <слово>\nПример: /remove_blacklist СБП")
         return
     
     word = args[1]
     user_id = message.from_user.id
     if user_id not in user_filters or "blacklist" not in user_filters[user_id]:
-        await message.answer("⚠️ Черный список пуст")
+        await safe_send_message(message, "⚠️ Черный список пуст")
         return
     
     if word in user_filters[user_id]["blacklist"]:
         user_filters[user_id]["blacklist"].remove(word)
-        await message.answer(f"✅ Удалено из черного списка: {word}")
+        await safe_send_message(message, f"✅ Удалено из черного списка: {word}")
         if not user_filters[user_id]["blacklist"]:
             del user_filters[user_id]["blacklist"]
     else:
-        await message.answer(f"⚠️ Слово '{word}' не найдено в черном списке")
+        await safe_send_message(message, f"⚠️ Слово '{word}' не найдено в черном списке")
 
 @dp.message(Command("add_whitelist"))
 async def cmd_add_whitelist(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("❌ Использование: /add_whitelist <слово>\nПример: /add_whitelist Т-Банк")
+        await safe_send_message(message, "❌ Использование: /add_whitelist <слово>\nПример: /add_whitelist Т-Банк")
         return
     
     word = args[1]
@@ -617,36 +645,36 @@ async def cmd_add_whitelist(message: Message):
     
     if word not in user_filters[user_id]["whitelist"]:
         user_filters[user_id]["whitelist"].append(word)
-        await message.answer(f"✅ Добавлено в белый список: {word}")
+        await safe_send_message(message, f"✅ Добавлено в белый список: {word}")
     else:
-        await message.answer(f"⚠️ Слово '{word}' уже в белом списке")
+        await safe_send_message(message, f"⚠️ Слово '{word}' уже в белом списке")
 
 @dp.message(Command("remove_whitelist"))
 async def cmd_remove_whitelist(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("❌ Использование: /remove_whitelist <слово>\nПример: /remove_whitelist Т-Банк")
+        await safe_send_message(message, "❌ Использование: /remove_whitelist <слово>\nПример: /remove_whitelist Т-Банк")
         return
     
     word = args[1]
     user_id = message.from_user.id
     if user_id not in user_filters or "whitelist" not in user_filters[user_id]:
-        await message.answer("⚠️ Белый список пуст")
+        await safe_send_message(message, "⚠️ Белый список пуст")
         return
     
     if word in user_filters[user_id]["whitelist"]:
         user_filters[user_id]["whitelist"].remove(word)
-        await message.answer(f"✅ Удалено из белого списка: {word}")
+        await safe_send_message(message, f"✅ Удалено из белого списка: {word}")
         if not user_filters[user_id]["whitelist"]:
             del user_filters[user_id]["whitelist"]
     else:
-        await message.answer(f"⚠️ Слово '{word}' не найдено в белом списке")
+        await safe_send_message(message, f"⚠️ Слово '{word}' не найдено в белом списке")
 
 @dp.message(Command("add_payment"))
 async def cmd_add_payment(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("❌ Использование: /add_payment <система>\nПример: /add_payment Т-Банк")
+        await safe_send_message(message, "❌ Использование: /add_payment <система>\nПример: /add_payment Т-Банк")
         return
     
     payment = args[1]
@@ -659,30 +687,30 @@ async def cmd_add_payment(message: Message):
     
     if payment not in user_filters[user_id]["payment_methods"]:
         user_filters[user_id]["payment_methods"].append(payment)
-        await message.answer(f"✅ Добавлена платежная система: {payment}")
+        await safe_send_message(message, f"✅ Добавлена платежная система: {payment}")
     else:
-        await message.answer(f"⚠️ Платежная система '{payment}' уже добавлена")
+        await safe_send_message(message, f"⚠️ Платежная система '{payment}' уже добавлена")
 
 @dp.message(Command("remove_payment"))
 async def cmd_remove_payment(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("❌ Использование: /remove_payment <система>\nПример: /remove_payment Т-Банк")
+        await safe_send_message(message, "❌ Использование: /remove_payment <система>\nПример: /remove_payment Т-Банк")
         return
     
     payment = args[1]
     user_id = message.from_user.id
     if user_id not in user_filters or "payment_methods" not in user_filters[user_id]:
-        await message.answer("⚠️ Список платежных систем пуст")
+        await safe_send_message(message, "⚠️ Список платежных систем пуст")
         return
     
     if payment in user_filters[user_id]["payment_methods"]:
         user_filters[user_id]["payment_methods"].remove(payment)
-        await message.answer(f"✅ Удалена платежная система: {payment}")
+        await safe_send_message(message, f"✅ Удалена платежная система: {payment}")
         if not user_filters[user_id]["payment_methods"]:
             del user_filters[user_id]["payment_methods"]
     else:
-        await message.answer(f"⚠️ Платежная система '{payment}' не найдена")
+        await safe_send_message(message, f"⚠️ Платежная система '{payment}' не найдена")
 
 
 async def on_startup():
