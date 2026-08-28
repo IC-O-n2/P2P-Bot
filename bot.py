@@ -1,578 +1,836 @@
+import asyncio
 import os
-import requests
-import json
-import time
+import logging
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import hmac
-import logging
-from datetime import datetime
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
-import sys
+import json
+import time
+from decimal import Decimal
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+import html
 
-# --- 1. Настройка логирования ---
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import Message
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения
+load_dotenv()
+
+# Настройка логирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- 2. Получение переменных окружения ---
+# Конфигурация
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    logger.error("❌ API ключи Bybit не найдены!")
-    sys.exit()
 
 if not TELEGRAM_TOKEN:
-    logger.error("❌ TELEGRAM_TOKEN не найден!")
-    sys.exit()
+    raise ValueError("TELEGRAM_TOKEN не найден в переменных окружения")
 
-# --- 3. Класс для работы с Bybit API ---
+if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+    logger.warning("⚠️ API ключи Bybit не найдены! Бот будет работать в ограниченном режиме.")
+
+# Хранилище для фильтров пользователей
+user_filters: Dict[int, Dict] = {}
+user_subscriptions: Dict[int, bool] = {}
+
+@dataclass
+class P2POffer:
+    """Класс для хранения данных P2P-объявления"""
+    side: str
+    price: float
+    amount: float
+    min_amount: float
+    max_amount: float
+    payment_methods: List[str]
+    description: str
+    link: str
+    merchant_name: str
+    is_verified: bool
+    token: str = "USDT"
+    fiat: str = "RUB"
+
+@dataclass
+class ArbitrageSignal:
+    """Класс для хранения сигнала арбитража"""
+    seller: P2POffer
+    buyer: P2POffer
+    spread: float
+    profit: float
+    timestamp: datetime
 
 class BybitP2PClient:
-    def __init__(self, api_key, api_secret):
+    """Клиент для работы с P2P API Bybit"""
+    
+    def __init__(self, api_key: str, api_secret: str):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = "https://api.bybit.com"
-        self.session = requests.Session()
+    
+    def _post_signed(self, path: str, payload: dict) -> dict:
+        """Выполняет подписанный POST запрос к Bybit API"""
+        recv_window_ms = 5000
+        timeout_seconds = 15
         
-    def _sign_request(self, endpoint, params):
-        """Подпись запроса согласно документации Bybit"""
         timestamp = str(int(time.time() * 1000))
-        recv_window = "5000"
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         
-        json_body = json.dumps(params, separators=(',', ':'))
-        sign_str = timestamp + self.api_key + recv_window + json_body
+        # Строка для подписи: timestamp + api_key + recv_window + body
+        signature_payload = f"{timestamp}{self.api_key}{recv_window_ms}{body}"
         
         signature = hmac.new(
-            bytes(self.api_secret, "utf-8"),
-            bytes(sign_str, "utf-8"),
-            hashlib.sha256
+            self.api_secret.encode("utf-8"),
+            signature_payload.encode("utf-8"),
+            hashlib.sha256,
         ).hexdigest()
         
-        headers = {
-            "X-BAPI-API-KEY": self.api_key,
-            "X-BAPI-TIMESTAMP": timestamp,
-            "X-BAPI-SIGN": signature,
-            "X-BAPI-RECV-WINDOW": recv_window,
-            "Content-Type": "application/json"
-        }
-        
-        return headers
-    
-    def get_p2p_orders(self, side="BUY", coin="USDT", fiat="RUB", limit=50):
-        """Получение P2P объявлений"""
-        endpoint = "/v5/p2p/item/online"
-        params = {
-            "coinId": coin,
-            "currencyId": fiat,
-            "side": side,
-            "page": "1",
-            "size": str(limit)
-        }
+        request = Request(
+            f"{self.base_url}{path}",
+            data=body.encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-BAPI-API-KEY": self.api_key,
+                "X-BAPI-TIMESTAMP": timestamp,
+                "X-BAPI-RECV-WINDOW": str(recv_window_ms),
+                "X-BAPI-SIGN": signature,
+            },
+            method="POST",
+        )
         
         try:
-            headers = self._sign_request(endpoint, params)
-            url = self.base_url + endpoint
-            
-            response = self.session.post(url, json=params, headers=headers, timeout=10)
-            data = response.json()
-            
-            if data.get("retCode") == 0:
-                return data.get("result", {}).get("items", [])
-            else:
-                logger.error(f"API Error: {data.get('retMsg')}")
-                return []
+            with urlopen(request, timeout=timeout_seconds) as response:
+                response_body = response.read().decode("utf-8")
+                return json.loads(response_body)
+        except HTTPError as error:
+            try:
+                response_body = error.read().decode("utf-8")
+                logger.error(f"HTTP ошибка {error.code}: {response_body[:200]}")
+            except:
+                logger.error(f"HTTP ошибка {error.code}")
+            return {}
+        except (URLError, TimeoutError, OSError) as error:
+            logger.error(f"Ошибка соединения: {error}")
+            return {}
+        except json.JSONDecodeError as error:
+            logger.error(f"Ошибка парсинга JSON: {error}")
+            return {}
+    
+    def get_online_ads(self, side: str, page: int = 1, size: int = 50) -> List[P2POffer]:
+        """
+        Получает P2P объявления с Bybit
+        
+        Args:
+            side: "BUY" или "SELL"
+            page: Номер страницы
+            size: Количество объявлений на странице
+        """
+        # Bybit side: 0 - покупка USDT (продажа RUB), 1 - продажа USDT (покупка RUB)
+        side_map = {"BUY": 0, "SELL": 1}
+        bybit_side = side_map.get(side.upper())
+        
+        if bybit_side is None:
+            raise ValueError("side должен быть 'BUY' или 'SELL'")
+        
+        result = self._post_signed(
+            "/v5/p2p/item/online",
+            {
+                "tokenId": "USDT",
+                "currencyId": "RUB",
+                "side": str(bybit_side),
+                "page": str(page),
+                "size": str(size),
+            },
+        )
+        
+        items = result.get("result", {}).get("items", [])
+        
+        if not items:
+            return []
+        
+        # Парсим объявления
+        offers = []
+        for item in items:
+            try:
+                # Извлекаем данные
+                price = float(item.get("price", 0))
+                min_amount = float(item.get("minAmount", 0))
+                max_amount = float(item.get("maxAmount", 0))
+                amount = (min_amount + max_amount) / 2 if min_amount > 0 and max_amount > 0 else min_amount
                 
+                # Платежные методы
+                payment_methods = []
+                for method in item.get("paymentMethods", []):
+                    name = method.get("name", "")
+                    if name:
+                        payment_methods.append(name)
+                
+                offer = P2POffer(
+                    side=side,
+                    price=price,
+                    amount=amount,
+                    min_amount=min_amount,
+                    max_amount=max_amount,
+                    payment_methods=payment_methods,
+                    description=item.get("description", ""),
+                    link=item.get("link", ""),
+                    merchant_name=item.get("nickName", "Аноним"),
+                    is_verified=item.get("isVerified", False)
+                )
+                offers.append(offer)
+            except (ValueError, KeyError) as e:
+                logger.warning(f"Ошибка парсинга объявления: {e}")
+                continue
+        
+        logger.info(f"Получено {len(offers)} объявлений для {side}")
+        return offers
+
+class P2PArbitrageBot:
+    """Основной класс бота для P2P арбитража"""
+    
+    def __init__(self, bot: Bot):
+        self.bot = bot
+        self.is_running = False
+        self.monitor_task: Optional[asyncio.Task] = None
+        self.bybit_client = None
+        
+        if BYBIT_API_KEY and BYBIT_API_SECRET:
+            self.bybit_client = BybitP2PClient(BYBIT_API_KEY, BYBIT_API_SECRET)
+            logger.info("✅ Bybit клиент инициализирован")
+        else:
+            logger.warning("⚠️ Bybit клиент не инициализирован (нет API ключей)")
+        
+    async def start(self):
+        """Запуск бота"""
+        self.is_running = True
+        self.monitor_task = asyncio.create_task(self._monitor_loop())
+        logger.info("Бот успешно запущен")
+        
+    async def stop(self):
+        """Остановка бота"""
+        self.is_running = False
+        if self.monitor_task:
+            self.monitor_task.cancel()
+        logger.info("Бот остановлен")
+    
+    def _fetch_p2p_offers_sync(self, side: str) -> List[P2POffer]:
+        """Получение P2P-объявлений с Bybit"""
+        if not self.bybit_client:
+            logger.warning("Bybit клиент не доступен")
+            return []
+        
+        try:
+            # Проверяем соединение с сервером
+            if side.upper() == "BUY":
+                return self.bybit_client.get_online_ads("BUY", page=1, size=50)
+            else:
+                return self.bybit_client.get_online_ads("SELL", page=1, size=50)
         except Exception as e:
-            logger.error(f"Request Error: {e}")
+            logger.error(f"Ошибка при получении объявлений: {e}")
             return []
-
-# --- 4. Класс для поиска связок ---
-
-class P2PArbitrageFinder:
-    def __init__(self, client):
-        self.client = client
-        self.payment_methods = {
-            "14": "СБП",
-            "18": "Банковский перевод",
-            "40": "T-Bank",
-            "90": "Сбербанк"
-        }
     
-    def parse_conditions(self, condition_text):
-        """Парсинг условий мейкера из текста"""
-        conditions = {
-            "exact_amount": None,
-            "pdf_required": False,
-            "sbp_blocked": False,
-            "support_24h": False,
-            "min_amount": None,
-            "max_amount": None
-        }
+    def _check_offer_conditions(self, offer: P2POffer, filters: Dict) -> Tuple[bool, str]:
+        """Проверка условий мейкера для объявления"""
+        if not filters:
+            return True, "OK"
         
-        if not condition_text:
-            return conditions
-            
-        lines = condition_text.lower().split('\n')
+        # Проверка суммы
+        if filters.get("exact_amount"):
+            if abs(offer.amount - filters["exact_amount"]) > 0.01:
+                return False, f"Сумма {offer.amount:.0f}₽ ≠ {filters['exact_amount']:.0f}₽"
         
-        for line in lines:
-            if 'заходить строго на сумму' in line:
-                try:
-                    amount = line.replace('заходить строго на сумму', '').strip()
-                    if 'k' in amount:
-                        amount = amount.replace('k', '').strip()
-                        conditions["exact_amount"] = float(amount) * 1000
-                    else:
-                        conditions["exact_amount"] = float(amount)
-                except:
-                    pass
-            
-            if 'пдф напрямую из тбанка' in line:
-                conditions["pdf_required"] = True
-            if 'с т-банка на сбп' in line and '❌' in line:
-                conditions["sbp_blocked"] = True
-            if 'на связи круглосуточно' in line:
-                conditions["support_24h"] = True
-                
-        return conditions
+        if filters.get("min_amount"):
+            if offer.amount < filters["min_amount"]:
+                return False, f"Сумма {offer.amount:.0f}₽ < {filters['min_amount']:.0f}₽"
+        
+        if filters.get("max_amount"):
+            if offer.amount > filters["max_amount"]:
+                return False, f"Сумма {offer.amount:.0f}₽ > {filters['max_amount']:.0f}₽"
+        
+        # Проверка текстовых условий
+        description_lower = offer.description.lower()
+        
+        # Черный список (исключаем)
+        for word in filters.get("blacklist", []):
+            if word.lower() in description_lower:
+                return False, f"Найдено запрещенное слово: {word}"
+        
+        # Белый список (требуем)
+        whitelist = filters.get("whitelist", [])
+        if whitelist:
+            found = any(word.lower() in description_lower for word in whitelist)
+            if not found:
+                return False, f"Нет обязательных слов из: {', '.join(whitelist)}"
+        
+        # Проверка платежных систем
+        if filters.get("payment_methods"):
+            offer_methods = [m.lower() for m in offer.payment_methods]
+            required = [m.lower() for m in filters["payment_methods"]]
+            if not any(m in offer_methods for m in required):
+                return False, f"Нет доступных платежных систем: {', '.join(filters['payment_methods'])}"
+        
+        return True, "OK"
     
-    def find_arbitrage_opportunities(self, min_spread=0.5, min_amount=1000, max_amount=10000, 
-                                    payment_methods=None, conditions_filter=None):
-        """Поиск арбитражных связок с фильтрацией по условиям"""
-        logger.info("🔍 Поиск арбитражных связок...")
+    def _find_arbitrage(self, sellers: List[P2POffer], buyers: List[P2POffer],
+                        user_filters: Dict) -> Optional[ArbitrageSignal]:
+        """Поиск арбитражной связки"""
+        if not sellers or not buyers:
+            return None
         
-        buy_orders = self.client.get_p2p_orders("BUY", limit=50)
-        sell_orders = self.client.get_p2p_orders("SELL", limit=50)
+        # Фильтруем продавцов и покупателей по условиям
+        filtered_sellers = []
+        for seller in sellers:
+            passes, _ = self._check_offer_conditions(seller, user_filters)
+            if passes:
+                filtered_sellers.append(seller)
         
-        if not buy_orders or not sell_orders:
-            logger.warning("❌ Не удалось получить объявления")
-            return []
+        filtered_buyers = []
+        for buyer in buyers:
+            passes, _ = self._check_offer_conditions(buyer, user_filters)
+            if passes:
+                filtered_buyers.append(buyer)
         
-        opportunities = []
+        if not filtered_sellers or not filtered_buyers:
+            return None
         
-        for buy in buy_orders:
-            buy_price = float(buy.get("price", 0))
-            if buy_price <= 0:
-                continue
-                
-            buy_conditions = self.parse_conditions(buy.get("memo", ""))
-            if conditions_filter and not self._match_conditions(buy_conditions, conditions_filter):
-                continue
-                
-            buy_payments = buy.get("paymentMethods", [])
-            buy_payment_ids = [str(pm.get("id", "")) for pm in buy_payments]
-            
-            if payment_methods and not any(pm in buy_payment_ids for pm in payment_methods):
-                continue
-            
-            for sell in sell_orders:
-                sell_price = float(sell.get("price", 0))
-                if sell_price <= 0:
-                    continue
-                    
-                sell_conditions = self.parse_conditions(sell.get("memo", ""))
-                if conditions_filter and not self._match_conditions(sell_conditions, conditions_filter):
-                    continue
-                    
-                sell_payments = sell.get("paymentMethods", [])
-                sell_payment_ids = [str(pm.get("id", "")) for pm in sell_payments]
-                
-                if payment_methods and not any(pm in sell_payment_ids for pm in payment_methods):
-                    continue
-                
-                buy_min = float(buy.get("minAmount", 0))
-                buy_max = float(buy.get("maxAmount", 0))
-                sell_min = float(sell.get("minAmount", 0))
-                sell_max = float(sell.get("maxAmount", 0))
-                
-                max_amount_possible = min(buy_max, sell_max)
-                min_amount_possible = max(buy_min, sell_min, min_amount)
-                
-                if max_amount_possible < min_amount_possible or max_amount_possible < min_amount:
-                    continue
-                
-                spread = ((sell_price - buy_price) / buy_price) * 100
-                
-                if spread >= min_spread:
-                    trade_amount = min(max_amount_possible, max_amount)
-                    usdt_amount = trade_amount / buy_price
-                    profit = trade_amount * (spread / 100)
-                    
-                    opportunity = {
-                        "buy_price": buy_price,
-                        "sell_price": sell_price,
-                        "spread": spread,
-                        "buy_seller": buy.get("advertiser", {}).get("nickName", "N/A"),
-                        "sell_seller": sell.get("advertiser", {}).get("nickName", "N/A"),
-                        "buy_conditions": buy_conditions,
-                        "sell_conditions": sell_conditions,
-                        "buy_payments": [self.payment_methods.get(str(pid), pid) for pid in buy_payment_ids],
-                        "sell_payments": [self.payment_methods.get(str(pid), pid) for pid in sell_payment_ids],
-                        "min_amount": min_amount_possible,
-                        "max_amount": max_amount_possible,
-                        "trade_amount": trade_amount,
-                        "usdt_amount": usdt_amount,
-                        "profit": profit,
-                        "buy_order": buy,
-                        "sell_order": sell
-                    }
-                    
-                    opportunities.append(opportunity)
+        # Берем лучшего продавца (самый дешевый) и покупателя (самый дорогой)
+        best_seller = min(filtered_sellers, key=lambda x: x.price)
+        best_buyer = max(filtered_buyers, key=lambda x: x.price)
         
-        opportunities.sort(key=lambda x: x["spread"], reverse=True)
-        logger.info(f"✅ Найдено {len(opportunities)} связок")
+        # Проверяем, что продавец дешевле покупателя
+        if best_seller.price >= best_buyer.price:
+            return None
         
-        return opportunities[:10]
-    
-    def _match_conditions(self, order_conditions, filter_conditions):
-        """Проверка соответствия условий фильтру"""
-        if not filter_conditions:
-            return True
-            
-        if filter_conditions.get("exact_amount"):
-            if order_conditions.get("exact_amount") != filter_conditions["exact_amount"]:
-                return False
-                
-        if filter_conditions.get("pdf_required") and not order_conditions.get("pdf_required"):
-            return False
-            
-        if filter_conditions.get("sbp_blocked") and order_conditions.get("sbp_blocked"):
-            return False
-            
-        return True
-
-# --- 5. Telegram бот (для версии 20.x) ---
-
-class P2PBot:
-    def __init__(self, token, api_key, api_secret):
-        self.token = token
-        self.client = BybitP2PClient(api_key, api_secret)
-        self.finder = P2PArbitrageFinder(self.client)
-        self.user_settings = {}
+        spread = ((best_buyer.price / best_seller.price) - 1) * 100
         
-    async def start(self, update, context):
-        """Обработчик команды /start"""
-        keyboard = [
-            [InlineKeyboardButton("🔍 Найти связки", callback_data="find_opportunities")],
-            [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="stats")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        # Проверка минимального спреда
+        min_spread = user_filters.get("min_spread", 0.5)
+        if spread < min_spread:
+            return None
         
-        await update.message.reply_text(
-            "🤖 *P2P Арбитраж Бот*\n\n"
-            "Я помогаю находить выгодные связки на Bybit P2P.\n\n"
-            "🔍 *Найти связки* - поиск арбитражных возможностей\n"
-            "⚙️ *Настройки* - настройка фильтров и условий\n"
-            "📊 *Статистика* - просмотр статистики\n\n"
-            "Для начала настройте фильтры в разделе настроек!",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
+        profit = best_buyer.price - best_seller.price
+        
+        return ArbitrageSignal(
+            seller=best_seller,
+            buyer=best_buyer,
+            spread=spread,
+            profit=profit,
+            timestamp=datetime.now()
         )
     
-    async def settings(self, update, context):
-        """Настройки бота"""
-        keyboard = [
-            [InlineKeyboardButton("💰 Минимальный спред", callback_data="set_spread")],
-            [InlineKeyboardButton("💵 Диапазон суммы", callback_data="set_amount")],
-            [InlineKeyboardButton("💳 Платежные методы", callback_data="set_payments")],
-            [InlineKeyboardButton("📝 Условия мейкера", callback_data="set_conditions")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        user_id = update.effective_user.id
-        settings = self.user_settings.get(user_id, {})
-        
-        settings_text = f"⚙️ *Текущие настройки:*\n\n"
-        settings_text += f"💰 Минимальный спред: {settings.get('min_spread', 0.5)}%\n"
-        settings_text += f"💵 Диапазон: {settings.get('min_amount', 1000)} - {settings.get('max_amount', 10000)} RUB\n"
-        settings_text += f"💳 Платежки: {', '.join(settings.get('payment_methods', ['Все']))}\n"
-        settings_text += f"📝 Условия мейкера: {'Включены' if settings.get('conditions_filter') else 'Выключены'}"
-        
-        if update.callback_query:
-            await update.callback_query.message.edit_text(
-                settings_text,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-            await update.callback_query.answer()
-        else:
-            await update.message.reply_text(
-                settings_text,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-    
-    async def find_opportunities(self, update, context):
-        """Поиск арбитражных связок"""
-        user_id = update.effective_user.id
-        settings = self.user_settings.get(user_id, {})
-        
-        if update.callback_query:
-            await update.callback_query.message.edit_text(
-                "🔍 *Идет поиск связок...*\n\n"
-                "Пожалуйста, подождите, это может занять несколько секунд.",
-                parse_mode='Markdown'
-            )
-            await update.callback_query.answer()
-        else:
-            await update.message.reply_text(
-                "🔍 Идет поиск связок...\nПожалуйста, подождите."
-            )
-        
-        opportunities = self.finder.find_arbitrage_opportunities(
-            min_spread=settings.get('min_spread', 0.5),
-            min_amount=settings.get('min_amount', 1000),
-            max_amount=settings.get('max_amount', 10000),
-            payment_methods=settings.get('payment_methods', None),
-            conditions_filter=settings.get('conditions_filter', None)
-        )
-        
-        if not opportunities:
-            response = (
-                "❌ *Связок не найдено*\n\n"
-                f"💰 Минимальный спред: {settings.get('min_spread', 0.5)}%\n"
-                f"💵 Диапазон: {settings.get('min_amount', 1000)} - {settings.get('max_amount', 10000)} RUB\n"
-                "💡 Попробуйте уменьшить минимальный спред или изменить фильтры."
-            )
-        else:
-            response = "✅ *Найденные связки:*\n\n"
-            for i, opp in enumerate(opportunities[:5], 1):
-                response += f"*#{i}* Спред: {opp['spread']:.2f}%\n"
-                response += f"📈 BUY: {opp['buy_price']:.2f} RUB y {opp['buy_seller']}\n"
-                response += f"📉 SELL: {opp['sell_price']:.2f} RUB y {opp['sell_seller']}\n"
-                response += f"💵 Сумма: {opp['trade_amount']:.2f} RUB (~{opp['usdt_amount']:.2f} USDT)\n"
-                response += f"💰 Прибыль: {opp['profit']:.2f} RUB\n"
-                
-                if opp.get('buy_payments'):
-                    response += f"💳 Платежки BUY: {', '.join(opp['buy_payments'][:3])}\n"
-                if opp.get('sell_payments'):
-                    response += f"💳 Платежки SELL: {', '.join(opp['sell_payments'][:3])}\n"
-                
-                if opp['buy_conditions'].get('exact_amount'):
-                    response += f"📝 Точная сумма: {opp['buy_conditions']['exact_amount']} RUB\n"
-                if opp['buy_conditions'].get('pdf_required'):
-                    response += f"📎 Требуется PDF из Т-Банка\n"
-                    
-                response += "\n" + "─" * 30 + "\n\n"
-            
-            response += f"\n📊 Всего найдено: {len(opportunities)} связок"
-        
-        keyboard = [
-            [InlineKeyboardButton("🔄 Обновить", callback_data="find_opportunities")],
-            [InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        if update.callback_query:
-            await update.callback_query.message.edit_text(
-                response,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-            await update.callback_query.answer()
-        else:
-            await update.message.reply_text(
-                response,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-    
-    async def set_spread(self, update, context):
-        """Установка минимального спреда"""
-        await update.callback_query.message.edit_text(
-            "💰 *Установка минимального спреда*\n\n"
-            "Введите минимальный спред в процентах (например: 0.5):",
-            parse_mode='Markdown'
-        )
-        await update.callback_query.answer()
-        context.user_data['setting'] = 'spread'
-    
-    async def set_amount(self, update, context):
-        """Установка диапазона суммы"""
-        await update.callback_query.message.edit_text(
-            "💵 *Установка диапазона суммы*\n\n"
-            "Введите минимальную и максимальную сумму через пробел (например: 1000 10000):",
-            parse_mode='Markdown'
-        )
-        await update.callback_query.answer()
-        context.user_data['setting'] = 'amount'
-    
-    async def set_payments(self, update, context):
-        """Настройка платежных методов"""
-        keyboard = [
-            [InlineKeyboardButton("✅ СБП", callback_data="pay_14")],
-            [InlineKeyboardButton("✅ Банковский перевод", callback_data="pay_18")],
-            [InlineKeyboardButton("✅ T-Bank", callback_data="pay_40")],
-            [InlineKeyboardButton("✅ Сбербанк", callback_data="pay_90")],
-            [InlineKeyboardButton("🗑️ Очистить все", callback_data="pay_clear")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="settings")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        user_id = update.effective_user.id
-        settings = self.user_settings.get(user_id, {})
-        selected = settings.get('payment_methods', [])
-        
-        text = "💳 *Выберите платежные методы:*\n\n"
-        text += "✅ - метод выбран\n\n"
-        text += f"Выбрано: {', '.join(selected) if selected else 'Ничего не выбрано'}"
-        
-        await update.callback_query.message.edit_text(
-            text,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-        await update.callback_query.answer()
-    
-    async def set_conditions(self, update, context):
-        """Настройка условий мейкера"""
-        user_id = update.effective_user.id
-        settings = self.user_settings.get(user_id, {})
-        current = settings.get('conditions_filter', False)
-        
-        keyboard = [
-            [InlineKeyboardButton(
-                f"{'✅' if current else '❌'} Учитывать условия мейкера",
-                callback_data="toggle_conditions"
-            )],
-            [InlineKeyboardButton("🔙 Назад", callback_data="settings")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        text = "📝 *Условия мейкера*\n\n"
-        text += "Условия мейкера - это дополнительные требования продавца.\n"
-        text += "Например: точная сумма сделки, PDF из Т-Банка, и т.д.\n\n"
-        text += f"Статус: {'Включены' if current else 'Выключены'}"
-        
-        await update.callback_query.message.edit_text(
-            text,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-        await update.callback_query.answer()
-    
-    async def handle_input(self, update, context):
-        """Обработка ввода пользователя"""
-        user_id = update.effective_user.id
-        setting = context.user_data.get('setting')
-        
-        if setting == 'spread':
+    async def _monitor_loop(self):
+        """Основной цикл мониторинга"""
+        while self.is_running:
             try:
-                value = float(update.message.text)
-                if value < 0 or value > 100:
-                    await update.message.reply_text("❌ Спред должен быть от 0 до 100%")
-                    return
-                    
-                self.user_settings.setdefault(user_id, {})['min_spread'] = value
-                await update.message.reply_text(f"✅ Минимальный спред установлен: {value}%")
+                if not self.bybit_client:
+                    logger.warning("Пропуск цикла: Bybit клиент не инициализирован")
+                    await asyncio.sleep(30)
+                    continue
                 
-            except ValueError:
-                await update.message.reply_text("❌ Пожалуйста, введите число (например: 0.5)")
-                
-        elif setting == 'amount':
-            try:
-                parts = update.message.text.split()
-                if len(parts) != 2:
-                    await update.message.reply_text("❌ Введите два числа через пробел")
-                    return
+                for user_id, filters in user_filters.items():
+                    if not user_subscriptions.get(user_id, False):
+                        continue
                     
-                min_amt = float(parts[0])
-                max_amt = float(parts[1])
-                
-                if min_amt >= max_amt:
-                    await update.message.reply_text("❌ Минимальная сумма должна быть меньше максимальной")
-                    return
+                    # Получаем объявления
+                    sellers = await asyncio.get_event_loop().run_in_executor(
+                        None, self._fetch_p2p_offers_sync, "SELL"
+                    )
+                    buyers = await asyncio.get_event_loop().run_in_executor(
+                        None, self._fetch_p2p_offers_sync, "BUY"
+                    )
                     
-                if min_amt < 0 or max_amt < 0:
-                    await update.message.reply_text("❌ Суммы должны быть положительными")
-                    return
+                    if not sellers or not buyers:
+                        logger.debug("Нет данных для поиска арбитража")
+                        continue
                     
-                self.user_settings.setdefault(user_id, {})['min_amount'] = min_amt
-                self.user_settings.setdefault(user_id, {})['max_amount'] = max_amt
-                await update.message.reply_text(f"✅ Диапазон установлен: {min_amt} - {max_amt} RUB")
+                    # Ищем арбитраж
+                    signal = self._find_arbitrage(sellers, buyers, filters)
+                    
+                    if signal:
+                        await self._send_signal(user_id, signal)
                 
-            except ValueError:
-                await update.message.reply_text("❌ Введите два числа через пробел")
+                # Ждем перед следующим циклом
+                await asyncio.sleep(15)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Ошибка в цикле мониторинга: {e}")
+                await asyncio.sleep(30)
+    
+    async def _send_signal(self, user_id: int, signal: ArbitrageSignal):
+        """Отправка сигнала пользователю"""
+        def escape_html(text):
+            return html.escape(str(text))
         
-        context.user_data['setting'] = None
-
-    async def button_handler(self, update, context):
-        """Обработчик кнопок"""
-        query = update.callback_query
-        data = query.data
+        seller_payments = ', '.join(signal.seller.payment_methods) if signal.seller.payment_methods else 'Любые'
+        buyer_payments = ', '.join(signal.buyer.payment_methods) if signal.buyer.payment_methods else 'Любые'
         
-        if data == "back_to_menu":
-            await self.start(update, context)
-            
-        elif data == "find_opportunities":
-            await self.find_opportunities(update, context)
-            
-        elif data == "settings":
-            await self.settings(update, context)
-            
-        elif data == "set_spread":
-            await self.set_spread(update, context)
-            
-        elif data == "set_amount":
-            await self.set_amount(update, context)
-            
-        elif data == "set_payments":
-            await self.set_payments(update, context)
-            
-        elif data == "set_conditions":
-            await self.set_conditions(update, context)
-            
-        elif data.startswith("pay_"):
-            user_id = update.effective_user.id
-            settings = self.user_settings.setdefault(user_id, {})
-            payment_methods = settings.get('payment_methods', [])
-            
-            payment_id = data.replace("pay_", "")
-            
-            if payment_id == "clear":
-                settings['payment_methods'] = []
-                await query.answer("🗑️ Все платежные методы очищены")
-            else:
-                payment_name = self.finder.payment_methods.get(payment_id, payment_id)
-                if payment_id in payment_methods:
-                    payment_methods.remove(payment_id)
-                    await query.answer(f"❌ {payment_name} удален")
-                else:
-                    payment_methods.append(payment_id)
-                    await query.answer(f"✅ {payment_name} добавлен")
-                    
-                settings['payment_methods'] = payment_methods
-            
-            await self.set_payments(update, context)
-            
-        elif data == "toggle_conditions":
-            user_id = update.effective_user.id
-            settings = self.user_settings.setdefault(user_id, {})
-            settings['conditions_filter'] = not settings.get('conditions_filter', False)
-            await self.set_conditions(update, context)
+        message = f"""
+🔥 <b>АРБИТРАЖНЫЙ СИГНАЛ</b> 🔥
 
-# --- 6. Основная функция ---
+<b>🟢 ПРОДАВЕЦ (SELLER)</b>
+• Курс: {signal.seller.price:.2f}₽
+• Сумма: {signal.seller.amount:,.0f}₽
+• Лимиты: {signal.seller.min_amount:,.0f} - {signal.seller.max_amount:,.0f}₽
+• Платежи: {escape_html(seller_payments)}
+• Мерчант: {escape_html(signal.seller.merchant_name)} {'✅' if signal.seller.is_verified else '❌'}
 
-def main():
-    """Запуск бота"""
-    bot = P2PBot(TELEGRAM_TOKEN, BYBIT_API_KEY, BYBIT_API_SECRET)
+<b>🔴 ПОКУПАТЕЛЬ (BUYER)</b>
+• Курс: {signal.buyer.price:.2f}₽
+• Сумма: {signal.buyer.amount:,.0f}₽
+• Лимиты: {signal.buyer.min_amount:,.0f} - {signal.buyer.max_amount:,.0f}₽
+• Платежи: {escape_html(buyer_payments)}
+• Мерчант: {escape_html(signal.buyer.merchant_name)} {'✅' if signal.buyer.is_verified else '❌'}
+
+<b>📊 РАСЧЕТ</b>
+• Спред: <b>{signal.spread:.2f}%</b>
+• Прибыль с 1 USDT: {signal.profit:.2f}₽
+
+⏰ {signal.timestamp.strftime('%H:%M:%S')}
+        """
+        
+        try:
+            await self.bot.send_message(
+                user_id,
+                message,
+                parse_mode=ParseMode.HTML
+            )
+            logger.info(f"Сигнал отправлен пользователю {user_id}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки сигнала: {e}")
     
-    # Создание приложения для версии 20.x
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    async def get_filter_settings(self, user_id: int) -> str:
+        """Получение текущих настроек фильтров"""
+        filters = user_filters.get(user_id, {})
+        if not filters:
+            return "🔧 Фильтры не настроены. Используйте /settings для настройки."
+        
+        settings = []
+        settings.append("📋 <b>Текущие настройки фильтров:</b>")
+        settings.append("")
+        
+        if filters.get("exact_amount"):
+            settings.append(f"• Точная сумма: {filters['exact_amount']:.0f}₽")
+        if filters.get("min_amount"):
+            settings.append(f"• Мин. сумма: {filters['min_amount']:.0f}₽")
+        if filters.get("max_amount"):
+            settings.append(f"• Макс. сумма: {filters['max_amount']:.0f}₽")
+        if filters.get("min_spread"):
+            settings.append(f"• Мин. спред: {filters['min_spread']}%")
+        if filters.get("blacklist"):
+            settings.append(f"• Черный список: {', '.join(filters['blacklist'])}")
+        if filters.get("whitelist"):
+            settings.append(f"• Белый список: {', '.join(filters['whitelist'])}")
+        if filters.get("payment_methods"):
+            settings.append(f"• Платежные системы: {', '.join(filters['payment_methods'])}")
+        
+        if len(settings) == 2:
+            settings.append("⚠️ Фильтры настроены, но неактивны (запустите /start_monitoring)")
+        
+        return "\n".join(settings)
+
+
+# Инициализация бота
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+arbitrage_bot = P2PArbitrageBot(bot)
+
+# Функция для безопасной отправки сообщений
+async def safe_send_message(message: Message, text: str):
+    """Отправка сообщения с безопасной обработкой HTML"""
+    try:
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
+        await message.answer(text.replace('<', '[').replace('>', ']'))
+
+# --- Обработчики команд ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    """Команда /start"""
+    welcome_text = """
+🚀 Добро пожаловать в P2P Арбитраж Бот!
+
+Я ищу арбитражные связки на Bybit P2P и присылаю тебе сигналы.
+
+<b>Доступные команды:</b>
+/start - Показать это сообщение
+/settings - Настройка фильтров
+/status - Статус мониторинга
+/start_monitoring - Запустить мониторинг
+/stop_monitoring - Остановить мониторинг
+/clear_filters - Очистить все фильтры
+/help - Помощь
+
+<b>Как это работает:</b>
+1. Настрой фильтры через /settings
+2. Запусти мониторинг /start_monitoring
+3. Бот будет искать выгодные связки
+4. При найденной связке получишь сигнал
+    """
+    await safe_send_message(message, welcome_text)
     
-    # Регистрация обработчиков
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CallbackQueryHandler(bot.button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_input))
+    if message.from_user.id not in user_filters:
+        user_filters[message.from_user.id] = {}
+        user_subscriptions[message.from_user.id] = False
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    """Команда /help"""
+    help_text = """
+📖 <b>Помощь по фильтрам</b>
+
+<b>Что можно настраивать:</b>
+
+1. <b>Сумма сделки</b>
+   /set_exact 28000 - строго 28 000 ₽
+   /set_min 25000 - минимум 25 000 ₽
+   /set_max 30000 - максимум 30 000 ₽
+
+2. <b>Текстовые условия</b>
+   /add_blacklist СБП - исключить объявления с "СБП"
+   /add_whitelist Т-Банк - искать только с "Т-Банк"
+   /remove_blacklist СБП - убрать из черного списка
+   /remove_whitelist Т-Банк - убрать из белого списка
+
+3. <b>Платежные системы</b>
+   /add_payment Т-Банк - добавить платежную систему
+   /remove_payment Т-Банк - убрать платежную систему
+
+4. <b>Спред</b>
+   /set_spread 0.5 - минимальный спред 0.5%
+
+5. <b>Управление</b>
+   /start_monitoring - запуск поиска
+   /stop_monitoring - остановка поиска
+   /status - текущий статус
+   /clear_filters - очистить все фильтры
+
+<b>Пример настройки:</b>
+1. /set_exact 28000
+2. /add_blacklist СБП
+3. /add_whitelist Т-Банк
+4. /set_spread 0.5
+5. /start_monitoring
+    """
+    await safe_send_message(message, help_text)
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    """Показать текущие настройки"""
+    settings_text = await arbitrage_bot.get_filter_settings(message.from_user.id)
+    await safe_send_message(message, settings_text)
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    """Статус мониторинга"""
+    user_id = message.from_user.id
+    is_active = user_subscriptions.get(user_id, False)
+    status_emoji = "🟢" if is_active else "🔴"
+    status_text = "Активен" if is_active else "Остановлен"
     
-    logger.info("🚀 Бот запущен!")
-    application.run_polling(allowed_updates=None)
+    settings_preview = await arbitrage_bot.get_filter_settings(user_id)
+    
+    status_message = f"""
+<b>Статус мониторинга:</b> {status_emoji} {status_text}
+
+{settings_preview}
+    """
+    await safe_send_message(message, status_message)
+
+@dp.message(Command("start_monitoring"))
+async def cmd_start_monitoring(message: Message):
+    """Запуск мониторинга"""
+    user_id = message.from_user.id
+    filters = user_filters.get(user_id, {})
+    
+    if not filters:
+        await safe_send_message(
+            message,
+            "⚠️ Сначала настройте фильтры!\n"
+            "Используйте /settings для просмотра и /help для инструкций."
+        )
+        return
+    
+    user_subscriptions[user_id] = True
+    await safe_send_message(
+        message,
+        "✅ Мониторинг запущен!\n"
+        "Бот будет присылать сигналы при нахождении выгодных связок.\n"
+        "Для остановки используйте /stop_monitoring"
+    )
+
+@dp.message(Command("stop_monitoring"))
+async def cmd_stop_monitoring(message: Message):
+    """Остановка мониторинга"""
+    user_id = message.from_user.id
+    user_subscriptions[user_id] = False
+    await safe_send_message(message, "⏹ Мониторинг остановлен.")
+
+@dp.message(Command("clear_filters"))
+async def cmd_clear_filters(message: Message):
+    """Очистка всех фильтров"""
+    user_id = message.from_user.id
+    user_filters[user_id] = {}
+    user_subscriptions[user_id] = False
+    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен.")
+
+# --- Команды для настройки фильтров ---
+
+@dp.message(Command("set_exact"))
+async def cmd_set_exact(message: Message):
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await safe_send_message(message, "❌ Использование: /set_exact <сумма>\nПример: /set_exact 28000")
+            return
+        
+        amount = float(args[1])
+        if amount <= 0:
+            await safe_send_message(message, "❌ Сумма должна быть положительной")
+            return
+        
+        user_id = message.from_user.id
+        if user_id not in user_filters:
+            user_filters[user_id] = {}
+        
+        user_filters[user_id].pop("min_amount", None)
+        user_filters[user_id].pop("max_amount", None)
+        user_filters[user_id]["exact_amount"] = amount
+        
+        await safe_send_message(message, f"✅ Установлена точная сумма: {amount:,.0f}₽")
+    except ValueError:
+        await safe_send_message(message, "❌ Введите корректное число")
+
+@dp.message(Command("set_min"))
+async def cmd_set_min(message: Message):
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await safe_send_message(message, "❌ Использование: /set_min <сумма>\nПример: /set_min 25000")
+            return
+        
+        amount = float(args[1])
+        if amount <= 0:
+            await safe_send_message(message, "❌ Сумма должна быть положительной")
+            return
+        
+        user_id = message.from_user.id
+        if user_id not in user_filters:
+            user_filters[user_id] = {}
+        
+        user_filters[user_id].pop("exact_amount", None)
+        user_filters[user_id]["min_amount"] = amount
+        
+        await safe_send_message(message, f"✅ Установлена минимальная сумма: {amount:,.0f}₽")
+    except ValueError:
+        await safe_send_message(message, "❌ Введите корректное число")
+
+@dp.message(Command("set_max"))
+async def cmd_set_max(message: Message):
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await safe_send_message(message, "❌ Использование: /set_max <сумма>\nПример: /set_max 30000")
+            return
+        
+        amount = float(args[1])
+        if amount <= 0:
+            await safe_send_message(message, "❌ Сумма должна быть положительной")
+            return
+        
+        user_id = message.from_user.id
+        if user_id not in user_filters:
+            user_filters[user_id] = {}
+        
+        user_filters[user_id].pop("exact_amount", None)
+        user_filters[user_id]["max_amount"] = amount
+        
+        await safe_send_message(message, f"✅ Установлена максимальная сумма: {amount:,.0f}₽")
+    except ValueError:
+        await safe_send_message(message, "❌ Введите корректное число")
+
+@dp.message(Command("set_spread"))
+async def cmd_set_spread(message: Message):
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await safe_send_message(message, "❌ Использование: /set_spread <процент>\nПример: /set_spread 0.5")
+            return
+        
+        spread = float(args[1])
+        if spread < 0:
+            await safe_send_message(message, "❌ Спред должен быть положительным")
+            return
+        
+        user_id = message.from_user.id
+        if user_id not in user_filters:
+            user_filters[user_id] = {}
+        
+        user_filters[user_id]["min_spread"] = spread
+        
+        await safe_send_message(message, f"✅ Установлен минимальный спред: {spread}%")
+    except ValueError:
+        await safe_send_message(message, "❌ Введите корректное число")
+
+@dp.message(Command("add_blacklist"))
+async def cmd_add_blacklist(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await safe_send_message(message, "❌ Использование: /add_blacklist <слово>\nПример: /add_blacklist СБП")
+        return
+    
+    word = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters:
+        user_filters[user_id] = {}
+    
+    if "blacklist" not in user_filters[user_id]:
+        user_filters[user_id]["blacklist"] = []
+    
+    if word not in user_filters[user_id]["blacklist"]:
+        user_filters[user_id]["blacklist"].append(word)
+        await safe_send_message(message, f"✅ Добавлено в черный список: {word}")
+    else:
+        await safe_send_message(message, f"⚠️ Слово '{word}' уже в черном списке")
+
+@dp.message(Command("remove_blacklist"))
+async def cmd_remove_blacklist(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await safe_send_message(message, "❌ Использование: /remove_blacklist <слово>\nПример: /remove_blacklist СБП")
+        return
+    
+    word = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters or "blacklist" not in user_filters[user_id]:
+        await safe_send_message(message, "⚠️ Черный список пуст")
+        return
+    
+    if word in user_filters[user_id]["blacklist"]:
+        user_filters[user_id]["blacklist"].remove(word)
+        await safe_send_message(message, f"✅ Удалено из черного списка: {word}")
+        if not user_filters[user_id]["blacklist"]:
+            del user_filters[user_id]["blacklist"]
+    else:
+        await safe_send_message(message, f"⚠️ Слово '{word}' не найдено в черном списке")
+
+@dp.message(Command("add_whitelist"))
+async def cmd_add_whitelist(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await safe_send_message(message, "❌ Использование: /add_whitelist <слово>\nПример: /add_whitelist Т-Банк")
+        return
+    
+    word = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters:
+        user_filters[user_id] = {}
+    
+    if "whitelist" not in user_filters[user_id]:
+        user_filters[user_id]["whitelist"] = []
+    
+    if word not in user_filters[user_id]["whitelist"]:
+        user_filters[user_id]["whitelist"].append(word)
+        await safe_send_message(message, f"✅ Добавлено в белый список: {word}")
+    else:
+        await safe_send_message(message, f"⚠️ Слово '{word}' уже в белом списке")
+
+@dp.message(Command("remove_whitelist"))
+async def cmd_remove_whitelist(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await safe_send_message(message, "❌ Использование: /remove_whitelist <слово>\nПример: /remove_whitelist Т-Банк")
+        return
+    
+    word = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters or "whitelist" not in user_filters[user_id]:
+        await safe_send_message(message, "⚠️ Белый список пуст")
+        return
+    
+    if word in user_filters[user_id]["whitelist"]:
+        user_filters[user_id]["whitelist"].remove(word)
+        await safe_send_message(message, f"✅ Удалено из белого списка: {word}")
+        if not user_filters[user_id]["whitelist"]:
+            del user_filters[user_id]["whitelist"]
+    else:
+        await safe_send_message(message, f"⚠️ Слово '{word}' не найдено в белом списке")
+
+@dp.message(Command("add_payment"))
+async def cmd_add_payment(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await safe_send_message(message, "❌ Использование: /add_payment <система>\nПример: /add_payment Т-Банк")
+        return
+    
+    payment = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters:
+        user_filters[user_id] = {}
+    
+    if "payment_methods" not in user_filters[user_id]:
+        user_filters[user_id]["payment_methods"] = []
+    
+    if payment not in user_filters[user_id]["payment_methods"]:
+        user_filters[user_id]["payment_methods"].append(payment)
+        await safe_send_message(message, f"✅ Добавлена платежная система: {payment}")
+    else:
+        await safe_send_message(message, f"⚠️ Платежная система '{payment}' уже добавлена")
+
+@dp.message(Command("remove_payment"))
+async def cmd_remove_payment(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await safe_send_message(message, "❌ Использование: /remove_payment <система>\nПример: /remove_payment Т-Банк")
+        return
+    
+    payment = args[1]
+    user_id = message.from_user.id
+    if user_id not in user_filters or "payment_methods" not in user_filters[user_id]:
+        await safe_send_message(message, "⚠️ Список платежных систем пуст")
+        return
+    
+    if payment in user_filters[user_id]["payment_methods"]:
+        user_filters[user_id]["payment_methods"].remove(payment)
+        await safe_send_message(message, f"✅ Удалена платежная система: {payment}")
+        if not user_filters[user_id]["payment_methods"]:
+            del user_filters[user_id]["payment_methods"]
+    else:
+        await safe_send_message(message, f"⚠️ Платежная система '{payment}' не найдена")
+
+
+async def on_startup():
+    """Действия при запуске бота"""
+    await arbitrage_bot.start()
+    logger.info("Бот запущен и готов к работе!")
+
+async def on_shutdown():
+    """Действия при остановке бота"""
+    await arbitrage_bot.stop()
+    logger.info("Бот остановлен")
+
+async def main():
+    """Главная функция"""
+    try:
+        await on_startup()
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+    finally:
+        await on_shutdown()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
