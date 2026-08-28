@@ -6,8 +6,8 @@ import hashlib
 import hmac
 import logging
 from datetime import datetime
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 import sys
 
 # --- 1. Настройка логирования ---
@@ -245,7 +245,7 @@ class P2PArbitrageFinder:
             
         return True
 
-# --- 5. Telegram бот (для версии 13.x) ---
+# --- 5. Telegram бот (для версии 20.x) ---
 
 class P2PBot:
     def __init__(self, token, api_key, api_secret):
@@ -254,7 +254,7 @@ class P2PBot:
         self.finder = P2PArbitrageFinder(self.client)
         self.user_settings = {}
         
-    def start(self, update, context):
+    async def start(self, update, context):
         """Обработчик команды /start"""
         keyboard = [
             [InlineKeyboardButton("🔍 Найти связки", callback_data="find_opportunities")],
@@ -263,7 +263,7 @@ class P2PBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        update.message.reply_text(
+        await update.message.reply_text(
             "🤖 *P2P Арбитраж Бот*\n\n"
             "Я помогаю находить выгодные связки на Bybit P2P.\n\n"
             "🔍 *Найти связки* - поиск арбитражных возможностей\n"
@@ -274,7 +274,7 @@ class P2PBot:
             reply_markup=reply_markup
         )
     
-    def settings(self, update, context):
+    async def settings(self, update, context):
         """Настройки бота"""
         keyboard = [
             [InlineKeyboardButton("💰 Минимальный спред", callback_data="set_spread")],
@@ -295,33 +295,33 @@ class P2PBot:
         settings_text += f"📝 Условия мейкера: {'Включены' if settings.get('conditions_filter') else 'Выключены'}"
         
         if update.callback_query:
-            update.callback_query.message.edit_text(
+            await update.callback_query.message.edit_text(
                 settings_text,
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
-            update.callback_query.answer()
+            await update.callback_query.answer()
         else:
-            update.message.reply_text(
+            await update.message.reply_text(
                 settings_text,
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
     
-    def find_opportunities(self, update, context):
+    async def find_opportunities(self, update, context):
         """Поиск арбитражных связок"""
         user_id = update.effective_user.id
         settings = self.user_settings.get(user_id, {})
         
         if update.callback_query:
-            update.callback_query.message.edit_text(
+            await update.callback_query.message.edit_text(
                 "🔍 *Идет поиск связок...*\n\n"
                 "Пожалуйста, подождите, это может занять несколько секунд.",
                 parse_mode='Markdown'
             )
-            update.callback_query.answer()
+            await update.callback_query.answer()
         else:
-            update.message.reply_text(
+            await update.message.reply_text(
                 "🔍 Идет поиск связок...\nПожалуйста, подождите."
             )
         
@@ -370,40 +370,40 @@ class P2PBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         if update.callback_query:
-            update.callback_query.message.edit_text(
+            await update.callback_query.message.edit_text(
                 response,
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
-            update.callback_query.answer()
+            await update.callback_query.answer()
         else:
-            update.message.reply_text(
+            await update.message.reply_text(
                 response,
                 parse_mode='Markdown',
                 reply_markup=reply_markup
             )
     
-    def set_spread(self, update, context):
+    async def set_spread(self, update, context):
         """Установка минимального спреда"""
-        update.callback_query.message.edit_text(
+        await update.callback_query.message.edit_text(
             "💰 *Установка минимального спреда*\n\n"
             "Введите минимальный спред в процентах (например: 0.5):",
             parse_mode='Markdown'
         )
-        update.callback_query.answer()
+        await update.callback_query.answer()
         context.user_data['setting'] = 'spread'
     
-    def set_amount(self, update, context):
+    async def set_amount(self, update, context):
         """Установка диапазона суммы"""
-        update.callback_query.message.edit_text(
+        await update.callback_query.message.edit_text(
             "💵 *Установка диапазона суммы*\n\n"
             "Введите минимальную и максимальную сумму через пробел (например: 1000 10000):",
             parse_mode='Markdown'
         )
-        update.callback_query.answer()
+        await update.callback_query.answer()
         context.user_data['setting'] = 'amount'
     
-    def set_payments(self, update, context):
+    async def set_payments(self, update, context):
         """Настройка платежных методов"""
         keyboard = [
             [InlineKeyboardButton("✅ СБП", callback_data="pay_14")],
@@ -423,14 +423,14 @@ class P2PBot:
         text += "✅ - метод выбран\n\n"
         text += f"Выбрано: {', '.join(selected) if selected else 'Ничего не выбрано'}"
         
-        update.callback_query.message.edit_text(
+        await update.callback_query.message.edit_text(
             text,
             parse_mode='Markdown',
             reply_markup=reply_markup
         )
-        update.callback_query.answer()
+        await update.callback_query.answer()
     
-    def set_conditions(self, update, context):
+    async def set_conditions(self, update, context):
         """Настройка условий мейкера"""
         user_id = update.effective_user.id
         settings = self.user_settings.get(user_id, {})
@@ -450,14 +450,14 @@ class P2PBot:
         text += "Например: точная сумма сделки, PDF из Т-Банка, и т.д.\n\n"
         text += f"Статус: {'Включены' if current else 'Выключены'}"
         
-        update.callback_query.message.edit_text(
+        await update.callback_query.message.edit_text(
             text,
             parse_mode='Markdown',
             reply_markup=reply_markup
         )
-        update.callback_query.answer()
+        await update.callback_query.answer()
     
-    def handle_input(self, update, context):
+    async def handle_input(self, update, context):
         """Обработка ввода пользователя"""
         user_id = update.effective_user.id
         setting = context.user_data.get('setting')
@@ -466,67 +466,67 @@ class P2PBot:
             try:
                 value = float(update.message.text)
                 if value < 0 or value > 100:
-                    update.message.reply_text("❌ Спред должен быть от 0 до 100%")
+                    await update.message.reply_text("❌ Спред должен быть от 0 до 100%")
                     return
                     
                 self.user_settings.setdefault(user_id, {})['min_spread'] = value
-                update.message.reply_text(f"✅ Минимальный спред установлен: {value}%")
+                await update.message.reply_text(f"✅ Минимальный спред установлен: {value}%")
                 
             except ValueError:
-                update.message.reply_text("❌ Пожалуйста, введите число (например: 0.5)")
+                await update.message.reply_text("❌ Пожалуйста, введите число (например: 0.5)")
                 
         elif setting == 'amount':
             try:
                 parts = update.message.text.split()
                 if len(parts) != 2:
-                    update.message.reply_text("❌ Введите два числа через пробел")
+                    await update.message.reply_text("❌ Введите два числа через пробел")
                     return
                     
                 min_amt = float(parts[0])
                 max_amt = float(parts[1])
                 
                 if min_amt >= max_amt:
-                    update.message.reply_text("❌ Минимальная сумма должна быть меньше максимальной")
+                    await update.message.reply_text("❌ Минимальная сумма должна быть меньше максимальной")
                     return
                     
                 if min_amt < 0 or max_amt < 0:
-                    update.message.reply_text("❌ Суммы должны быть положительными")
+                    await update.message.reply_text("❌ Суммы должны быть положительными")
                     return
                     
                 self.user_settings.setdefault(user_id, {})['min_amount'] = min_amt
                 self.user_settings.setdefault(user_id, {})['max_amount'] = max_amt
-                update.message.reply_text(f"✅ Диапазон установлен: {min_amt} - {max_amt} RUB")
+                await update.message.reply_text(f"✅ Диапазон установлен: {min_amt} - {max_amt} RUB")
                 
             except ValueError:
-                update.message.reply_text("❌ Введите два числа через пробел")
+                await update.message.reply_text("❌ Введите два числа через пробел")
         
         context.user_data['setting'] = None
 
-    def button_handler(self, update, context):
+    async def button_handler(self, update, context):
         """Обработчик кнопок"""
         query = update.callback_query
         data = query.data
         
         if data == "back_to_menu":
-            self.start(update, context)
+            await self.start(update, context)
             
         elif data == "find_opportunities":
-            self.find_opportunities(update, context)
+            await self.find_opportunities(update, context)
             
         elif data == "settings":
-            self.settings(update, context)
+            await self.settings(update, context)
             
         elif data == "set_spread":
-            self.set_spread(update, context)
+            await self.set_spread(update, context)
             
         elif data == "set_amount":
-            self.set_amount(update, context)
+            await self.set_amount(update, context)
             
         elif data == "set_payments":
-            self.set_payments(update, context)
+            await self.set_payments(update, context)
             
         elif data == "set_conditions":
-            self.set_conditions(update, context)
+            await self.set_conditions(update, context)
             
         elif data.startswith("pay_"):
             user_id = update.effective_user.id
@@ -537,25 +537,25 @@ class P2PBot:
             
             if payment_id == "clear":
                 settings['payment_methods'] = []
-                query.answer("🗑️ Все платежные методы очищены")
+                await query.answer("🗑️ Все платежные методы очищены")
             else:
                 payment_name = self.finder.payment_methods.get(payment_id, payment_id)
                 if payment_id in payment_methods:
                     payment_methods.remove(payment_id)
-                    query.answer(f"❌ {payment_name} удален")
+                    await query.answer(f"❌ {payment_name} удален")
                 else:
                     payment_methods.append(payment_id)
-                    query.answer(f"✅ {payment_name} добавлен")
+                    await query.answer(f"✅ {payment_name} добавлен")
                     
                 settings['payment_methods'] = payment_methods
             
-            self.set_payments(update, context)
+            await self.set_payments(update, context)
             
         elif data == "toggle_conditions":
             user_id = update.effective_user.id
             settings = self.user_settings.setdefault(user_id, {})
             settings['conditions_filter'] = not settings.get('conditions_filter', False)
-            self.set_conditions(update, context)
+            await self.set_conditions(update, context)
 
 # --- 6. Основная функция ---
 
@@ -563,18 +563,16 @@ def main():
     """Запуск бота"""
     bot = P2PBot(TELEGRAM_TOKEN, BYBIT_API_KEY, BYBIT_API_SECRET)
     
-    # Создание updater для версии 13.x
-    updater = Updater(TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    # Создание приложения для версии 20.x
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     # Регистрация обработчиков
-    dp.add_handler(CommandHandler("start", bot.start))
-    dp.add_handler(CallbackQueryHandler(bot.button_handler))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, bot.handle_input))
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CallbackQueryHandler(bot.button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_input))
     
     logger.info("🚀 Бот запущен!")
-    updater.start_polling()
-    updater.idle()
+    application.run_polling(allowed_updates=None)
 
 if __name__ == "__main__":
     main()
