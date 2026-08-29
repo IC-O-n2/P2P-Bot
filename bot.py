@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 import html
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import Message
+from aiogram.types import Message, BotCommand
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
@@ -524,6 +524,22 @@ class P2PArbitrageBot:
         return "\n".join(settings)
 
 
+# Функция для установки команд бота
+async def set_bot_commands(bot: Bot):
+    """Устанавливает меню команд для бота"""
+    commands = [
+        BotCommand(command="settings", description="📋 Показать текущие настройки фильтров"),
+        BotCommand(command="status", description="📊 Статус мониторинга"),
+        BotCommand(command="start_monitoring", description="▶️ Запустить мониторинг арбитража"),
+        BotCommand(command="stop_monitoring", description="⏹ Остановить мониторинг"),
+        BotCommand(command="clear_filters", description="🧹 Очистить все фильтры"),
+        BotCommand(command="help", description="❓ Помощь по настройке фильтров"),
+        BotCommand(command="start", description="🚀 Главное меню"),
+    ]
+    await bot.set_my_commands(commands)
+    logger.info("✅ Меню команд установлено")
+
+
 # Инициализация бота
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -931,6 +947,8 @@ async def cmd_remove_payment(message: Message):
 
 async def on_startup():
     """Действия при запуске бота"""
+    # Устанавливаем меню команд
+    await set_bot_commands(bot)
     await arbitrage_bot.start()
     logger.info("Бот запущен и готов к работе!")
 
