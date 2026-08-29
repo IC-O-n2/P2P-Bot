@@ -57,7 +57,7 @@ def post_signed(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     )
     
     print(f"   🔑 Подпись создана")
-    print(f"   📝 Тело: {body}")
+    print(f"   📝 Тело запроса: {body}")
     
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
@@ -147,7 +147,14 @@ print("\n" + "="*60)
 if buy_orders and sell_orders:
     print("✅ УСПЕШНОЕ ПОДКЛЮЧЕНИЕ К BYBIT P2P")
     print("="*60)
-    print("📋 ПЕРВЫЕ 5 ОБЪЯВЛЕНИЙ (BUY и SELL):\n")
+    
+    # --- ВЫВОДИМ ВСЕ АРГУМЕНТЫ ПЕРВОГО ОБЪЯВЛЕНИЯ (МЕЙКЕРА) ---
+    print("\n🔍 ПОЛНЫЙ JSON ОТВЕТ BYBIT ДЛЯ ПЕРВОГО ОБЪЯВЛЕНИЯ (BUY):")
+    print("="*60)
+    print(json.dumps(buy_orders[0], indent=2, ensure_ascii=False, default=str))
+    print("="*60)
+    
+    print("\n📋 ПЕРВЫЕ 5 ОБЪЯВЛЕНИЙ (BUY и SELL):\n")
     
     max_orders = min(5, len(buy_orders), len(sell_orders))
     
@@ -189,130 +196,72 @@ if buy_orders and sell_orders:
         print(f"   SELL: {fmt(sell_price)} RUB y {sell_seller}")
         print(f"   Сумма: {fmt(trade_amount)} RUB (~{fmt(usdt_amount)} USDT)")
         
-        # --- ИНФОРМАЦИЯ О ПЛАТЕЖНЫХ СИСТЕМАХ МЕЙКЕРОВ ---
-        print(f"\n   💳 ПЛАТЕЖНЫЕ СИСТЕМЫ:")
-        
-        # BUY объявление - платежные системы продавца (покупает USDT)
+        # Дополнительная информация из объявлений
         buy_methods = buy.get("paymentMethods", [])
         if buy_methods:
-            print(f"      BUY мейкер ({buy_seller}):")
-            for method in buy_methods:
-                method_name = method.get("name", "N/A")
-                method_type = method.get("type", "N/A")
-                # Проверяем есть ли дополнительные поля
-                method_id = method.get("id", "")
-                print(f"         • {method_name} (тип: {method_type})")
-                # Если есть ID платежной системы, выводим его
-                if method_id:
-                    print(f"           ID: {method_id}")
-        else:
-            print(f"      BUY мейкер ({buy_seller}): Нет информации о платежных системах")
+            methods = [m.get("name", "N/A") for m in buy_methods[:2]]
+            print(f"   Оплата: {', '.join(methods)}")
         
-        # SELL объявление - платежные системы продавца (продает USDT)
-        sell_methods = sell.get("paymentMethods", [])
-        if sell_methods:
-            print(f"      SELL мейкер ({sell_seller}):")
-            for method in sell_methods:
-                method_name = method.get("name", "N/A")
-                method_type = method.get("type", "N/A")
-                method_id = method.get("id", "")
-                print(f"         • {method_name} (тип: {method_type})")
-                if method_id:
-                    print(f"           ID: {method_id}")
-        else:
-            print(f"      SELL мейкер ({sell_seller}): Нет информации о платежных системах")
-        
-        # --- Дополнительная информация о платежах из объявления ---
-        print(f"\n   📋 Детали платежей:")
-        
-        # Получаем информацию о платежах из разных полей
-        buy_payment_info = buy.get("paymentInfo", [])
-        if buy_payment_info:
-            print(f"      BUY детали:")
-            for info in buy_payment_info:
-                for key, value in info.items():
-                    if value:
-                        print(f"         {key}: {value}")
-        
-        sell_payment_info = sell.get("paymentInfo", [])
-        if sell_payment_info:
-            print(f"      SELL детали:")
-            for info in sell_payment_info:
-                for key, value in info.items():
-                    if value:
-                        print(f"         {key}: {value}")
-        
-        # Проверяем другие возможные поля с платежными системами
-        buy_payment_id = buy.get("paymentId", "")
-        if buy_payment_id:
-            print(f"      BUY Payment ID: {buy_payment_id}")
-        
-        sell_payment_id = sell.get("paymentId", "")
-        if sell_payment_id:
-            print(f"      SELL Payment ID: {sell_payment_id}")
-        
-        # --- Статистика по платежным системам ---
-        print(f"\n   📊 Статистика платежных систем:")
-        
-        # Собираем все уникальные платежные системы для BUY
-        buy_methods_names = [m.get("name", "") for m in buy_methods if m.get("name")]
-        sell_methods_names = [m.get("name", "") for m in sell_methods if m.get("name")]
-        
-        if buy_methods_names:
-            print(f"      BUY доступные способы: {', '.join(buy_methods_names)}")
-        else:
-            print(f"      BUY: способы не указаны")
-        
-        if sell_methods_names:
-            print(f"      SELL доступные способы: {', '.join(sell_methods_names)}")
-        else:
-            print(f"      SELL: способы не указаны")
-        
-        # Проверяем есть ли совпадения в платежных системах
-        common_methods = set(buy_methods_names) & set(sell_methods_names)
-        if common_methods:
-            print(f"      🔄 Общие способы оплаты: {', '.join(common_methods)}")
+        # Выводим все ключи объявления для первого мейкера
+        if i == 0:
+            print("\n   📋 ВСЕ ПОЛЯ ПЕРВОГО ОБЪЯВЛЕНИЯ (BUY):")
+            for key, value in buy.items():
+                if key != "paymentMethods":  # paymentMethods выводим отдельно
+                    print(f"      {key}: {value}")
+            print(f"      paymentMethods: {json.dumps(buy.get('paymentMethods', []), indent=6, ensure_ascii=False)}")
+            
+            print("\n   📋 ВСЕ ПОЛЯ ПЕРВОГО ОБЪЯВЛЕНИЯ (SELL):")
+            for key, value in sell.items():
+                if key != "paymentMethods":
+                    print(f"      {key}: {value}")
+            print(f"      paymentMethods: {json.dumps(sell.get('paymentMethods', []), indent=6, ensure_ascii=False)}")
         
         print("-" * 40)
     
     print(f"\n✅ Всего получено: {len(buy_orders)} BUY и {len(sell_orders)} SELL объявлений")
     print("🎯 ДАННЫЕ ОТ BYBIT ПОЛУЧЕНЫ УСПЕШНО!")
     
+    # --- ДОПОЛНИТЕЛЬНЫЙ ВЫВОД ПОЛНОГО RAW ОТВЕТА ---
+    print("\n" + "="*60)
+    print("📦 ПОЛНЫЙ RAW JSON ОТВЕТ BYBIT (весь результат):")
+    print("="*60)
+    print(json.dumps({
+        "buy_orders": buy_orders,
+        "sell_orders": sell_orders
+    }, indent=2, ensure_ascii=False, default=str))
+    print("="*60)
+    
 elif buy_orders:
     print("⚠️ Получены только BUY объявления")
     print(f"   BUY: {len(buy_orders)} объявлений")
     
-    print("\n📋 BUY объявления с платежными системами:")
+    # Выводим полные данные первого объявления
+    print("\n🔍 ПОЛНЫЙ JSON ОТВЕТ BYBIT ДЛЯ ПЕРВОГО ОБЪЯВЛЕНИЯ (BUY):")
+    print("="*60)
+    print(json.dumps(buy_orders[0], indent=2, ensure_ascii=False, default=str))
+    print("="*60)
+    
+    print("\n📋 BUY объявления:")
     for i, buy in enumerate(buy_orders[:5], 1):
         price = buy.get("price", "N/A")
         seller = buy.get("nickName", "N/A")
         print(f"   {i}. {price} RUB y {seller}")
-        
-        # Выводим платежные системы для BUY
-        methods = buy.get("paymentMethods", [])
-        if methods:
-            method_names = [m.get("name", "N/A") for m in methods]
-            print(f"      💳 Способы оплаты: {', '.join(method_names)}")
-        else:
-            print(f"      💳 Способы оплаты: не указаны")
     
 elif sell_orders:
     print("⚠️ Получены только SELL объявления")
     print(f"   SELL: {len(sell_orders)} объявлений")
     
-    print("\n📋 SELL объявления с платежными системами:")
+    # Выводим полные данные первого объявления
+    print("\n🔍 ПОЛНЫЙ JSON ОТВЕТ BYBIT ДЛЯ ПЕРВОГО ОБЪЯВЛЕНИЯ (SELL):")
+    print("="*60)
+    print(json.dumps(sell_orders[0], indent=2, ensure_ascii=False, default=str))
+    print("="*60)
+    
+    print("\n📋 SELL объявления:")
     for i, sell in enumerate(sell_orders[:5], 1):
         price = sell.get("price", "N/A")
         seller = sell.get("nickName", "N/A")
         print(f"   {i}. {price} RUB y {seller}")
-        
-        # Выводим платежные системы для SELL
-        methods = sell.get("paymentMethods", [])
-        if methods:
-            method_names = [m.get("name", "N/A") for m in methods]
-            print(f"      💳 Способы оплаты: {', '.join(method_names)}")
-        else:
-            print(f"      💳 Способы оплаты: не указаны")
     
 else:
     print("❌ НЕ УДАЛОСЬ ПОЛУЧИТЬ ДАННЫЕ ОТ BYBIT")
