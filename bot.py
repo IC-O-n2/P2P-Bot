@@ -360,12 +360,6 @@ class P2PArbitrageBot:
             if offer.min_amount > filters["max_amount"]:
                 return False, f"Мин. сумма {offer.min_amount:.0f}₽ > {filters['max_amount']:.0f}₽"
         
-        if filters.get("payment_methods"):
-            offer_methods = [m.lower() for m in offer.payment_methods]
-            required = [m.lower() for m in filters["payment_methods"]]
-            if not any(m in offer_methods for m in required):
-                return False, f"Нет доступных платежных систем: {', '.join(filters['payment_methods'])}"
-        
         return True, "OK"
     
     def _generate_profile_url(self, user_mask_id: str) -> str:
@@ -643,8 +637,6 @@ class P2PArbitrageBot:
             settings.append(f"• Мин. спред: {filters['min_spread']}%")
         if filters.get("blacklist"):
             settings.append(f"• Черный список (ники мерчантов): {', '.join(filters['blacklist'])}")
-        if filters.get("payment_methods"):
-            settings.append(f"• Платежные системы: {', '.join(filters['payment_methods'])}")
         
         if len(settings) == 2:
             settings.append("⚠️ Фильтры настроены, но неактивны (запустите /start_monitoring)")
@@ -726,19 +718,12 @@ async def cmd_help(message: Message):
    <b>⚠️ ВАЖНО:</b> Черный список работает ТОЛЬКО с никами мерчантов!
    • Bybit API НЕ передает текстовые условия/описания объявлений
    • Черный список НЕ может фильтровать по описанию или условиям мейкера
-   • Черный список НЕ может фильтровать по платежным системам (для этого есть /add_payment)
    • Если хотите исключить мерчанта - добавьте его полный ник или часть ника
 
-3. <b>Платежные системы</b>
-   /add_payment Т-Банк - показывать только объявления с этой платежной системой
-   /remove_payment Т-Банк - убрать фильтр по платежной системе
-   
-   <b>ℹ️ Информация:</b> Платежные системы передаются API и фильтруются корректно
-
-4. <b>Спред</b>
+3. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
 
-5. <b>Управление</b>
+4. <b>Управление</b>
    /start_monitoring - запуск поиска
    /stop_monitoring - остановка поиска
    /status - текущий статус
@@ -755,8 +740,7 @@ async def cmd_help(message: Message):
 3. /set_spread 0.5
 4. /add_blacklist "Мошенник Иван"
 5. /add_blacklist "ALL FOR ALL"
-6. /add_payment Т-Банк
-7. /start_monitoring
+6. /start_monitoring
 
 <b>Как работает черный список:</b>
 • Проверяет только НИК мерчанта
@@ -764,11 +748,6 @@ async def cmd_help(message: Message):
 • Можно добавить как полное имя, так и часть
 • Пример: /add_blacklist "Мошенник" - исключит всех мерчантов с этим словом в нике
 • Пример: /add_blacklist "ALL FOR ALL" - исключит только этого конкретного мерчанта
-
-<b>Как работают платежные системы:</b>
-• Фильтруют по платежным системам из объявления
-• Если список пуст - показываются все платежные системы
-• Если добавлены системы - показываются только объявления с ними
     """
     await safe_send_message(message, help_text)
 
@@ -958,8 +937,7 @@ async def cmd_add_blacklist(message: Message):
             "Пример: /add_blacklist Мошенник\n"
             "Пример с кавычками: /add_blacklist \"ALL FOR ALL\"\n\n"
             "⚠️ Черный список работает ТОЛЬКО с никами мерчантов!\n"
-            "Bybit API не передает описания/условия, поэтому фильтр по ним невозможен.\n"
-            "Для фильтрации по платежным системам используйте /add_payment"
+            "Bybit API не передает описания/условия, поэтому фильтр по ним невозможен."
         )
         return
     
@@ -1004,49 +982,6 @@ async def cmd_remove_blacklist(message: Message):
             del user_filters[user_id]["blacklist"]
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' не найдено в черном списке")
-
-@dp.message(Command("add_payment"))
-async def cmd_add_payment(message: Message):
-    args = parse_args_with_quotes(message.text)
-    if len(args) != 2:
-        await safe_send_message(message, "❌ Использование: /add_payment <система>\nПример: /add_payment Т-Банк")
-        return
-    
-    payment = args[1]
-    user_id = message.from_user.id
-    if user_id not in user_filters:
-        user_filters[user_id] = {}
-    
-    if "payment_methods" not in user_filters[user_id]:
-        user_filters[user_id]["payment_methods"] = []
-    
-    if payment not in user_filters[user_id]["payment_methods"]:
-        user_filters[user_id]["payment_methods"].append(payment)
-        await safe_send_message(message, f"✅ Добавлена платежная система: {payment}\n"
-                                   f"Теперь бот будет показывать только объявления с этой платежной системой")
-    else:
-        await safe_send_message(message, f"⚠️ Платежная система '{payment}' уже добавлена")
-
-@dp.message(Command("remove_payment"))
-async def cmd_remove_payment(message: Message):
-    args = parse_args_with_quotes(message.text)
-    if len(args) != 2:
-        await safe_send_message(message, "❌ Использование: /remove_payment <система>\nПример: /remove_payment Т-Банк")
-        return
-    
-    payment = args[1]
-    user_id = message.from_user.id
-    if user_id not in user_filters or "payment_methods" not in user_filters[user_id]:
-        await safe_send_message(message, "⚠️ Список платежных систем пуст")
-        return
-    
-    if payment in user_filters[user_id]["payment_methods"]:
-        user_filters[user_id]["payment_methods"].remove(payment)
-        await safe_send_message(message, f"✅ Удалена платежная система: {payment}")
-        if not user_filters[user_id]["payment_methods"]:
-            del user_filters[user_id]["payment_methods"]
-    else:
-        await safe_send_message(message, f"⚠️ Платежная система '{payment}' не найдена")
 
 
 async def on_startup():
