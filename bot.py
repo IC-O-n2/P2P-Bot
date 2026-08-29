@@ -48,6 +48,9 @@ user_subscriptions: Dict[int, bool] = {}
 # Хранилище для отправленных сигналов (с временем)
 sent_signals: Dict[int, Dict[str, datetime]] = {}
 
+# Хранилище для настроек задержки между сигналами (по умолчанию 4 секунды)
+user_signal_delay: Dict[int, int] = {}
+
 # Вспомогательная функция для парсинга аргументов с поддержкой кавычек
 def parse_args_with_quotes(text: str) -> List[str]:
     """
@@ -534,6 +537,9 @@ class P2PArbitrageBot:
                         if user_id not in sent_signals:
                             sent_signals[user_id] = {}
                         
+                        # Получаем задержку для пользователя (по умолчанию 4 секунды)
+                        delay_seconds = user_signal_delay.get(user_id, 4)
+                        
                         sent_count = 0
                         skipped_count = 0
                         
@@ -553,12 +559,15 @@ class P2PArbitrageBot:
                                 sent_signals[user_id][signal.signal_id] = datetime.now()
                                 sent_count += 1
                                 logger.info(f"Отправлен сигнал #{sent_count}: SELL={signal.seller.merchant_name} {signal.seller.price:.2f}₽, BUY={signal.buyer.merchant_name} {signal.buyer.price:.2f}₽, прибыль={signal.profit_rub:.2f}₽")
-                                await asyncio.sleep(4)
+                                
+                                # Используем задержку между сигналами
+                                if sent_count < len(signals[:30]):
+                                    await asyncio.sleep(delay_seconds)
                             else:
                                 skipped_count += 1
                         
                         if sent_count > 0:
-                            logger.info(f"Отправлено {sent_count} новых сигналов пользователю {user_id} (пропущено {skipped_count} дубликатов)")
+                            logger.info(f"Отправлено {sent_count} новых сигналов пользователю {user_id} (пропущено {skipped_count} дубликатов, задержка {delay_seconds}с)")
                         else:
                             logger.info(f"Новых сигналов нет для пользователя {user_id} (все {len(signals)} уже отправлены)")
                 
@@ -620,8 +629,10 @@ class P2PArbitrageBot:
     async def get_filter_settings(self, user_id: int) -> str:
         """Получение текущих настроек фильтров"""
         filters = user_filters.get(user_id, {})
+        delay = user_signal_delay.get(user_id, 4)
+        
         if not filters:
-            return "🔧 Фильтры не настроены. Используйте /help для настройки."
+            return f"🔧 Фильтры не настроены. Используйте /help для настройки.\n\n⏱ Задержка между сигналами: {delay}с"
         
         settings = []
         settings.append("📋 <b>Текущие настройки фильтров:</b>")
@@ -638,7 +649,10 @@ class P2PArbitrageBot:
         if filters.get("blacklist"):
             settings.append(f"• Черный список (ники мерчантов): {', '.join(filters['blacklist'])}")
         
-        if len(settings) == 2:
+        settings.append("")
+        settings.append(f"⏱ <b>Задержка между сигналами:</b> {delay}с")
+        
+        if len(settings) == 3:
             settings.append("⚠️ Фильтры настроены, но неактивны (запустите /start_monitoring)")
         
         return "\n".join(settings)
@@ -652,6 +666,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="status", description="📊 Статус мониторинга"),
         BotCommand(command="start_monitoring", description="▶️ Запустить мониторинг арбитража"),
         BotCommand(command="stop_monitoring", description="⏹ Остановить мониторинг"),
+        BotCommand(command="delay", description="⏱ Установить задержку между сигналами (сек)"),
         BotCommand(command="clear_filters", description="🧹 Очистить все фильтры"),
         BotCommand(command="help", description="❓ Настройка фильтров"),
     ]
@@ -680,6 +695,7 @@ async def cmd_start(message: Message):
 /status - Статус мониторинга
 /start_monitoring - Запустить мониторинг
 /stop_monitoring - Остановить мониторинг
+/delay - Установить задержку между сигналами
 /clear_filters - Очистить все фильтры
 
 <b>Как это работает:</b>
@@ -694,6 +710,7 @@ async def cmd_start(message: Message):
         user_filters[message.from_user.id] = {}
         user_subscriptions[message.from_user.id] = False
         sent_signals[message.from_user.id] = {}
+        user_signal_delay[message.from_user.id] = 4
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -721,7 +738,15 @@ async def cmd_help(message: Message):
 3. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
 
-4. <b>Управление</b>
+4. <b>Задержка между сигналами</b>
+   /delay 5 - установить задержку 5 секунд между отправками сигналов
+   /delay 2 - установить задержку 2 секунды (быстрее)
+   /delay 10 - установить задержку 10 секунд (медленнее)
+   
+   <b>⚠️ ВАЖНО:</b> Если задержка слишком маленькая (1-2с), 
+   вы можете получить много сообщений подряд. Рекомендуем 3-5 секунд.
+
+5. <b>Управление</b>
    /start_monitoring - запуск поиска
    /stop_monitoring - остановка поиска
    /status - текущий статус
@@ -736,9 +761,10 @@ async def cmd_help(message: Message):
 1. /set_min 500
 2. /set_max 10000
 3. /set_spread 0.5
-4. /add_blacklist "Мошенник Иван"
-5. /add_blacklist "ALL FOR ALL"
-6. /start_monitoring
+4. /delay 5
+5. /add_blacklist "Мошенник Иван"
+6. /add_blacklist "ALL FOR ALL"
+7. /start_monitoring
 
 <b>Как работает черный список:</b>
 • Проверяет только НИК мерчанта
@@ -793,11 +819,14 @@ async def cmd_start_monitoring(message: Message):
     sent_signals[user_id] = {}
     
     user_subscriptions[user_id] = True
+    delay = user_signal_delay.get(user_id, 4)
+    
     await safe_send_message(
         message,
-        "✅ Мониторинг запущен!\n"
-        "Бот будет присылать сигналы при нахождении выгодных связок.\n"
-        "Для остановки используйте /stop_monitoring"
+        f"✅ Мониторинг запущен!\n"
+        f"Бот будет присылать сигналы при нахождении выгодных связок.\n"
+        f"⏱ Задержка между сигналами: {delay}с\n"
+        f"Для остановки используйте /stop_monitoring"
     )
 
 @dp.message(Command("stop_monitoring"))
@@ -818,6 +847,54 @@ async def cmd_stop_monitoring(message: Message):
         "Все активные задачи для вас отменены."
     )
 
+@dp.message(Command("delay"))
+async def cmd_delay(message: Message):
+    """Установка задержки между сигналами"""
+    try:
+        args = parse_args_with_quotes(message.text)
+        if len(args) != 2:
+            await safe_send_message(
+                message, 
+                "❌ Использование: /delay <секунды>\n"
+                "Пример: /delay 5\n\n"
+                "Рекомендуемые значения:\n"
+                "• 3-5 секунд - оптимально\n"
+                "• 1-2 секунды - очень быстро (может быть много сообщений)\n"
+                "• 8-10 секунд - медленно (меньше сообщений)"
+            )
+            return
+        
+        delay = float(args[1])
+        if delay < 1:
+            await safe_send_message(
+                message, 
+                "❌ Задержка должна быть не менее 1 секунды"
+            )
+            return
+        
+        if delay > 60:
+            await safe_send_message(
+                message, 
+                "❌ Задержка не может превышать 60 секунд"
+            )
+            return
+        
+        user_id = message.from_user.id
+        user_signal_delay[user_id] = delay
+        
+        await safe_send_message(
+            message, 
+            f"⏱ Задержка между сигналами установлена: {delay}с\n\n"
+            f"Теперь бот будет отправлять сигналы с интервалом {delay} секунд.\n"
+            f"Это поможет избежать спама при большом количестве сигналов."
+        )
+    except ValueError:
+        await safe_send_message(
+            message, 
+            "❌ Введите корректное число секунд\n"
+            "Пример: /delay 5"
+        )
+
 @dp.message(Command("clear_filters"))
 async def cmd_clear_filters(message: Message):
     """Очистка всех фильтров"""
@@ -825,7 +902,8 @@ async def cmd_clear_filters(message: Message):
     user_filters[user_id] = {}
     user_subscriptions[user_id] = False
     sent_signals[user_id] = {}
-    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен.")
+    # Задержку НЕ сбрасываем, оставляем как была
+    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен. Задержка сохранена.")
 
 # --- Команды для настройки фильтров ---
 
@@ -1005,4 +1083,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
