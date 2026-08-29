@@ -203,6 +203,7 @@ class P2PArbitrageBot:
         self.is_running = False
         self.monitor_task: Optional[asyncio.Task] = None
         self.bybit_client = None
+        self._stop_requested = False  # Флаг для экстренной остановки
         
         if BYBIT_API_KEY and BYBIT_API_SECRET:
             self.bybit_client = BybitP2PClient(BYBIT_API_KEY, BYBIT_API_SECRET)
@@ -213,15 +214,29 @@ class P2PArbitrageBot:
     async def start(self):
         """Запуск бота"""
         self.is_running = True
+        self._stop_requested = False
         self.monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info("Бот успешно запущен")
         
     async def stop(self):
         """Остановка бота"""
         self.is_running = False
+        self._stop_requested = True
         if self.monitor_task:
             self.monitor_task.cancel()
+            try:
+                await self.monitor_task
+            except asyncio.CancelledError:
+                pass
         logger.info("Бот остановлен")
+    
+    async def stop_for_user(self, user_id: int):
+        """Остановка мониторинга для конкретного пользователя"""
+        user_subscriptions[user_id] = False
+        # Очищаем кэш отправленных сигналов для пользователя
+        if user_id in sent_signals:
+            sent_signals[user_id].clear()
+        logger.info(f"Мониторинг остановлен для пользователя {user_id}")
     
     def _fetch_p2p_offers_sync(self, side: str) -> List[P2POffer]:
         """Получение P2P-объявлений с Bybit"""
@@ -387,15 +402,35 @@ class P2PArbitrageBot:
     
     async def _monitor_loop(self):
         """Основной цикл мониторинга"""
-        while self.is_running:
+        while self.is_running and not self._stop_requested:
             try:
                 if not self.bybit_client:
                     logger.warning("Пропуск цикла: Bybit клиент не инициализирован")
                     await asyncio.sleep(30)
                     continue
                 
-                for user_id, filters in user_filters.items():
+                # Получаем список активных пользователей ДО начала цикла
+                active_users = []
+                for user_id, is_active in user_subscriptions.items():
+                    if is_active and not self._stop_requested:
+                        active_users.append(user_id)
+                
+                if not active_users:
+                    await asyncio.sleep(15)
+                    continue
+                
+                for user_id in active_users:
+                    # Проверяем флаг остановки перед каждым пользователем
+                    if not self.is_running or self._stop_requested:
+                        logger.info(f"Остановка мониторинга по запросу пользователя {user_id}")
+                        return
+                    
+                    # Проверяем, активен ли пользователь
                     if not user_subscriptions.get(user_id, False):
+                        continue
+                    
+                    filters = user_filters.get(user_id, {})
+                    if not filters:
                         continue
                     
                     self._clean_old_signals(user_id)
@@ -403,9 +438,20 @@ class P2PArbitrageBot:
                     sellers = await asyncio.get_event_loop().run_in_executor(
                         None, self._fetch_p2p_offers_sync, "SELL"
                     )
+                    
+                    # Проверяем флаг остановки после получения sellers
+                    if not self.is_running or self._stop_requested:
+                        logger.info(f"Остановка мониторинга после получения SELL объявлений")
+                        return
+                    
                     buyers = await asyncio.get_event_loop().run_in_executor(
                         None, self._fetch_p2p_offers_sync, "BUY"
                     )
+                    
+                    # Проверяем флаг остановки после получения buyers
+                    if not self.is_running or self._stop_requested:
+                        logger.info(f"Остановка мониторинга после получения BUY объявлений")
+                        return
                     
                     if not sellers or not buyers:
                         continue
@@ -422,6 +468,16 @@ class P2PArbitrageBot:
                         skipped_count = 0
                         
                         for signal in signals[:30]:
+                            # Проверяем флаг остановки перед отправкой каждого сигнала
+                            if not self.is_running or self._stop_requested:
+                                logger.info(f"Остановка мониторинга во время отправки сигналов")
+                                return
+                            
+                            # Проверяем, активен ли пользователь
+                            if not user_subscriptions.get(user_id, False):
+                                logger.info(f"Пользователь {user_id} отключил мониторинг, пропускаем сигналы")
+                                break
+                            
                             if signal.signal_id not in sent_signals[user_id]:
                                 await self._send_signal(user_id, signal)
                                 sent_signals[user_id][signal.signal_id] = datetime.now()
@@ -439,6 +495,7 @@ class P2PArbitrageBot:
                 await asyncio.sleep(15)
                 
             except asyncio.CancelledError:
+                logger.info("Цикл мониторинга отменен")
                 break
             except Exception as e:
                 logger.error(f"Ошибка в цикле мониторинга: {e}")
@@ -458,7 +515,7 @@ class P2PArbitrageBot:
         seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
         
-        # Формируем сообщение БЕЗ индикатора верификации
+        # Формируем сообщение
         message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
 
 🟢 ПРОДАВЕЦ (SELLER)
@@ -673,6 +730,7 @@ async def cmd_start_monitoring(message: Message):
         )
         return
     
+    # Очищаем старые сигналы при новом запуске
     sent_signals[user_id] = {}
     
     user_subscriptions[user_id] = True
@@ -687,8 +745,19 @@ async def cmd_start_monitoring(message: Message):
 async def cmd_stop_monitoring(message: Message):
     """Остановка мониторинга"""
     user_id = message.from_user.id
+    
+    # Немедленно останавливаем для этого пользователя
     user_subscriptions[user_id] = False
-    await safe_send_message(message, "⏹ Мониторинг остановлен.")
+    
+    # Очищаем кэш отправленных сигналов
+    if user_id in sent_signals:
+        sent_signals[user_id].clear()
+    
+    await safe_send_message(
+        message, 
+        "⏹ Мониторинг остановлен.\n"
+        "Все активные задачи для вас отменены."
+    )
 
 @dp.message(Command("clear_filters"))
 async def cmd_clear_filters(message: Message):
