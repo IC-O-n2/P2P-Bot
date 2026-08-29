@@ -63,7 +63,7 @@ class P2POffer:
     is_verified: bool
     item_id: str
     user_id: str
-    user_mask_id: str  # Добавляем поле userMaskId
+    user_mask_id: str
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -173,7 +173,18 @@ class BybitP2PClient:
                 
                 item_id = str(item.get("itemId", ""))
                 user_id = str(item.get("uid", ""))
-                user_mask_id = str(item.get("userMaskId", ""))  # Получаем userMaskId
+                user_mask_id = str(item.get("userMaskId", ""))
+                
+                # Проверяем наличие isVerified в разных форматах
+                is_verified = item.get("isVerified", False)
+                # Если isVerified нет, пробуем другие возможные поля
+                if not is_verified:
+                    is_verified = item.get("verified", False)
+                    if not is_verified:
+                        is_verified = item.get("isVerifiedMerchant", False)
+                
+                # Логируем для отладки
+                logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: isVerified={is_verified}")
                 
                 offer = P2POffer(
                     side=side,
@@ -185,10 +196,10 @@ class BybitP2PClient:
                     description=item.get("description", ""),
                     link="",
                     merchant_name=item.get("nickName", "Аноним"),
-                    is_verified=item.get("isVerified", False),
+                    is_verified=bool(is_verified),  # Приводим к bool
                     item_id=item_id,
                     user_id=user_id,
-                    user_mask_id=user_mask_id  # Сохраняем userMaskId
+                    user_mask_id=user_mask_id
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
@@ -245,6 +256,10 @@ class P2PArbitrageBot:
         """Проверка условий мейкера для объявления"""
         if not filters:
             return True, "OK"
+        
+        # Проверка верификации
+        if filters.get("only_verified", False) and not offer.is_verified:
+            return False, "Мерчант не верифицирован"
         
         # Проверка суммы
         if filters.get("exact_amount"):
@@ -457,23 +472,27 @@ class P2PArbitrageBot:
         trade_amount = min(signal.seller.max_amount, signal.buyer.max_amount)
         usdt_amount = trade_amount / signal.seller.price if signal.seller.price > 0 else 0
         
-        # Генерируем ссылки на профили используя user_mask_id (как в bot_links.py)
+        # Генерируем ссылки на профили используя user_mask_id
         seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
         
-        # Формируем сообщение с обычными текстовыми ссылками (без HTML)
+        # Определяем статус верификации
+        seller_verified = "✅" if signal.seller.is_verified else "❌"
+        buyer_verified = "✅" if signal.buyer.is_verified else "❌"
+        
+        # Формируем сообщение
         message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
 
 🟢 ПРОДАВЕЦ (SELLER)
 • Курс: {signal.seller.price:.2f}₽
 • Лимиты: {format_number(signal.seller.min_amount)} - {format_number(signal.seller.max_amount)}₽
-• Мерчант: {signal.seller.merchant_name} {'❌' if not signal.seller.is_verified else '✅'}
+• Мерчант: {signal.seller.merchant_name} {seller_verified}
 • Ссылка на профиль: {seller_profile_url}
 
 🔴 ПОКУПАТЕЛЬ (BUYER)
 • Курс: {signal.buyer.price:.2f}₽
 • Лимиты: {format_number(signal.buyer.min_amount)} - {format_number(signal.buyer.max_amount)}₽
-• Мерчант: {signal.buyer.merchant_name} {'❌' if not signal.buyer.is_verified else '✅'}
+• Мерчант: {signal.buyer.merchant_name} {buyer_verified}
 • Ссылка на профиль: {buyer_profile_url}
 
 📊 РАСЧЕТ ПРИБЫЛИ
@@ -487,8 +506,8 @@ class P2PArbitrageBot:
             await self.bot.send_message(
                 user_id,
                 message,
-                parse_mode=None,  # Отключаем HTML парсинг
-                disable_web_page_preview=True  # Отключаем превью ссылок
+                parse_mode=None,
+                disable_web_page_preview=True
             )
         except Exception as e:
             logger.error(f"Ошибка отправки сигнала: {e}")
@@ -503,6 +522,8 @@ class P2PArbitrageBot:
         settings.append("📋 <b>Текущие настройки фильтров:</b>")
         settings.append("")
         
+        if filters.get("only_verified"):
+            settings.append("• ✅ Только верифицированные мерчанты")
         if filters.get("exact_amount"):
             settings.append(f"• Точная сумма: {filters['exact_amount']:.0f}₽")
         if filters.get("min_amount"):
@@ -534,6 +555,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="stop_monitoring", description="⏹ Остановить мониторинг"),
         BotCommand(command="clear_filters", description="🧹 Очистить все фильтры"),
         BotCommand(command="help", description="❓ Помощь по настройке фильтров"),
+        BotCommand(command="only_verified", description="✅ Только верифицированные мерчанты"),
         BotCommand(command="start", description="🚀 Главное меню"),
     ]
     await bot.set_my_commands(commands)
@@ -571,6 +593,7 @@ async def cmd_start(message: Message):
 /start_monitoring - Запустить мониторинг
 /stop_monitoring - Остановить мониторинг
 /clear_filters - Очистить все фильтры
+/only_verified - Только верифицированные мерчанты
 /help - Помощь
 
 <b>Как это работает:</b>
@@ -610,7 +633,10 @@ async def cmd_help(message: Message):
 4. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
 
-5. <b>Управление</b>
+5. <b>Верификация</b>
+   /only_verified - показывать только верифицированных мерчантов
+
+6. <b>Управление</b>
    /start_monitoring - запуск поиска
    /stop_monitoring - остановка поиска
    /status - текущий статус
@@ -622,7 +648,8 @@ async def cmd_help(message: Message):
 3. /set_spread 0.5
 4. /add_blacklist СБП
 5. /add_whitelist Т-Банк
-6. /start_monitoring
+6. /only_verified
+7. /start_monitoring
 
 <b>Как работают списки:</b>
 • <b>Черный список</b> - запрещает показывать объявления с этими словами
@@ -701,6 +728,24 @@ async def cmd_clear_filters(message: Message):
     user_subscriptions[user_id] = False
     sent_signals[user_id] = {}
     await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен.")
+
+@dp.message(Command("only_verified"))
+async def cmd_only_verified(message: Message):
+    """Включить фильтр только верифицированных мерчантов"""
+    user_id = message.from_user.id
+    if user_id not in user_filters:
+        user_filters[user_id] = {}
+    
+    # Переключаем фильтр
+    current = user_filters[user_id].get("only_verified", False)
+    user_filters[user_id]["only_verified"] = not current
+    
+    status = "включен" if user_filters[user_id]["only_verified"] else "выключен"
+    await safe_send_message(
+        message, 
+        f"✅ Фильтр 'Только верифицированные мерчанты' {status}.\n"
+        f"Теперь бот будет {'показывать только' if user_filters[user_id]['only_verified'] else 'показывать всех'} верифицированных мерчантов."
+    )
 
 # --- Команды для настройки фильтров ---
 
@@ -947,7 +992,6 @@ async def cmd_remove_payment(message: Message):
 
 async def on_startup():
     """Действия при запуске бота"""
-    # Устанавливаем меню команд
     await set_bot_commands(bot)
     await arbitrage_bot.start()
     logger.info("Бот запущен и готов к работе!")
