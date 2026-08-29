@@ -648,12 +648,12 @@ class P2PArbitrageBot:
 async def set_bot_commands(bot: Bot):
     """Устанавливает меню команд для бота"""
     commands = [
-        BotCommand(command="settings", description="📋 Настройки фильтров"),
+        BotCommand(command="settings", description="📋 Показать текущие настройки фильтров"),
         BotCommand(command="status", description="📊 Статус мониторинга"),
-        BotCommand(command="start_monitoring", description="▶️ Запустить мониторинг"),
+        BotCommand(command="start_monitoring", description="▶️ Запустить мониторинг арбитража"),
         BotCommand(command="stop_monitoring", description="⏹ Остановить мониторинг"),
         BotCommand(command="clear_filters", description="🧹 Очистить все фильтры"),
-        BotCommand(command="help", description="❓ Помощь"),
+        BotCommand(command="help", description="❓ Помощь по настройке фильтров"),
     ]
     await bot.set_my_commands(commands)
     logger.info("✅ Меню команд установлено")
@@ -670,20 +670,23 @@ arbitrage_bot = P2PArbitrageBot(bot)
 async def cmd_start(message: Message):
     """Команда /start"""
     welcome_text = """
-🚀 P2P Арбитраж Бот
+🚀 Добро пожаловать в P2P Арбитраж Бот!
 
-<b>Команды:</b>
-/settings — Настройки фильтров
-/status — Статус мониторинга
-/start_monitoring — Запустить поиск
-/stop_monitoring — Остановить поиск
-/clear_filters — Очистить все фильтры
-/help — Помощь
+Я ищу арбитражные связки на Bybit P2P и присылаю тебе сигналы.
 
-<b>Как работает:</b>
-1. Настройте фильтры через /settings
-2. Запустите мониторинг /start_monitoring
-3. Бот найдет выгодные связки и пришлет сигналы
+<b>Доступные команды:</b>
+/settings - Настройка фильтров
+/status - Статус мониторинга
+/start_monitoring - Запустить мониторинг
+/stop_monitoring - Остановить мониторинг
+/clear_filters - Очистить все фильтры
+/help - Помощь
+
+<b>Как это работает:</b>
+1. Настрой фильтры через /settings
+2. Запусти мониторинг /start_monitoring
+3. Бот будет искать выгодные связки
+4. При найденной связке получишь сигнал со ссылками на профили
     """
     await safe_send_message(message, welcome_text)
     
@@ -696,31 +699,53 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     """Команда /help"""
     help_text = """
-<b>НАСТРОЙКА ФИЛЬТРОВ</b>
+📖 <b>Помощь по фильтрам</b>
 
-<b>Сумма сделки:</b>
-/set_exact 28000 — строго 28 000 ₽
-/set_min 25000 — минимум 25 000 ₽
-/set_max 30000 — максимум 30 000 ₽
+<b>Что можно настраивать:</b>
 
-<b>Черный список (по нику мерчанта):</b>
-/add_blacklist "Мошенник" — исключить мерчантов с этим словом в нике
-/add_blacklist "ALL FOR ALL" — исключить конкретного мерчанта
-/remove_blacklist "Мошенник" — удалить из черного списка
+1. <b>Сумма сделки</b>
+   /set_exact 28000 - строго 28 000 ₽
+   /set_min 25000 - минимум 25 000 ₽
+   /set_max 30000 - максимум 30 000 ₽
 
-<b>Спред:</b>
-/set_spread 0.5 — минимальный спред 0.5%
+2. <b>Черный список (исключаем по никам мерчантов)</b>
+   /add_blacklist "Имя Мерчанта" - НЕ показывать объявления этого мерчанта
+   /add_blacklist Мошенник - НЕ показывать объявления мерчантов с этим словом в нике
+   /remove_blacklist "Имя Мерчанта" - убрать из черного списка
+   
+   <b>⚠️ ВАЖНО:</b> Черный список работает ТОЛЬКО с никами мерчантов!
+   • Bybit API НЕ передает текстовые условия/описания объявлений
+   • Черный список НЕ может фильтровать по описанию или условиям мейкера
+   • Если хотите исключить мерчанта - добавьте его полный ник или часть ника
 
-<b>Управление:</b>
-/start_monitoring — запустить поиск
-/stop_monitoring — остановить поиск
-/status — текущий статус
-/clear_filters — очистить все фильтры
+3. <b>Спред</b>
+   /set_spread 0.5 - минимальный спред 0.5%
 
-<b>ВАЖНО:</b>
-Черный список работает ТОЛЬКО с никами мерчантов.
-Bybit API НЕ передает описания и условия объявлений.
-Используйте кавычки для фраз с пробелами: /add_blacklist "Имя Фамилия"
+4. <b>Управление</b>
+   /start_monitoring - запуск поиска
+   /stop_monitoring - остановка поиска
+   /status - текущий статус
+   /clear_filters - очистить все фильтры
+
+<b>Важно про кавычки!</b>
+Если имя мерчанта состоит из нескольких слов, заключите его в кавычки:
+/add_blacklist "ALL FOR ALL"
+/add_blacklist "Иван Петров"
+
+<b>Пример настройки:</b>
+1. /set_min 500
+2. /set_max 10000
+3. /set_spread 0.5
+4. /add_blacklist "Мошенник Иван"
+5. /add_blacklist "ALL FOR ALL"
+6. /start_monitoring
+
+<b>Как работает черный список:</b>
+• Проверяет только НИК мерчанта
+• Регистр не важен
+• Можно добавить как полное имя, так и часть
+• Пример: /add_blacklist "Мошенник" - исключит всех мерчантов с этим словом в нике
+• Пример: /add_blacklist "ALL FOR ALL" - исключит только этого конкретного мерчанта
     """
     await safe_send_message(message, help_text)
 
@@ -743,7 +768,7 @@ async def cmd_status(message: Message):
     signals_count = len(sent_signals.get(user_id, {}))
     
     status_message = f"""
-<b>Статус:</b> {status_emoji} {status_text}
+<b>Статус мониторинга:</b> {status_emoji} {status_text}
 <b>Отправлено сигналов:</b> {signals_count}
 
 {settings_preview}
@@ -759,28 +784,39 @@ async def cmd_start_monitoring(message: Message):
     if not filters:
         await safe_send_message(
             message,
-            "⚠️ Настройте фильтры через /settings или /help"
+            "⚠️ Сначала настройте фильтры!\n"
+            "Используйте /settings для просмотра и /help для инструкций."
         )
         return
     
+    # Очищаем старые сигналы при новом запуске
     sent_signals[user_id] = {}
-    user_subscriptions[user_id] = True
     
+    user_subscriptions[user_id] = True
     await safe_send_message(
         message,
-        "✅ Мониторинг запущен\nДля остановки: /stop_monitoring"
+        "✅ Мониторинг запущен!\n"
+        "Бот будет присылать сигналы при нахождении выгодных связок.\n"
+        "Для остановки используйте /stop_monitoring"
     )
 
 @dp.message(Command("stop_monitoring"))
 async def cmd_stop_monitoring(message: Message):
     """Остановка мониторинга"""
     user_id = message.from_user.id
+    
+    # Немедленно останавливаем для этого пользователя
     user_subscriptions[user_id] = False
     
+    # Очищаем кэш отправленных сигналов
     if user_id in sent_signals:
         sent_signals[user_id].clear()
     
-    await safe_send_message(message, "⏹ Мониторинг остановлен")
+    await safe_send_message(
+        message, 
+        "⏹ Мониторинг остановлен.\n"
+        "Все активные задачи для вас отменены."
+    )
 
 @dp.message(Command("clear_filters"))
 async def cmd_clear_filters(message: Message):
@@ -789,7 +825,7 @@ async def cmd_clear_filters(message: Message):
     user_filters[user_id] = {}
     user_subscriptions[user_id] = False
     sent_signals[user_id] = {}
-    await safe_send_message(message, "🧹 Все фильтры очищены")
+    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен.")
 
 # --- Команды для настройки фильтров ---
 
@@ -814,9 +850,9 @@ async def cmd_set_exact(message: Message):
         user_filters[user_id].pop("max_amount", None)
         user_filters[user_id]["exact_amount"] = amount
         
-        await safe_send_message(message, f"✅ Точная сумма: {amount:,.0f}₽")
+        await safe_send_message(message, f"✅ Установлена точная сумма: {amount:,.0f}₽")
     except ValueError:
-        await safe_send_message(message, "❌ Введите число")
+        await safe_send_message(message, "❌ Введите корректное число")
 
 @dp.message(Command("set_min"))
 async def cmd_set_min(message: Message):
@@ -838,9 +874,9 @@ async def cmd_set_min(message: Message):
         user_filters[user_id].pop("exact_amount", None)
         user_filters[user_id]["min_amount"] = amount
         
-        await safe_send_message(message, f"✅ Мин. сумма: {amount:,.0f}₽")
+        await safe_send_message(message, f"✅ Установлена минимальная сумма: {amount:,.0f}₽")
     except ValueError:
-        await safe_send_message(message, "❌ Введите число")
+        await safe_send_message(message, "❌ Введите корректное число")
 
 @dp.message(Command("set_max"))
 async def cmd_set_max(message: Message):
@@ -862,9 +898,9 @@ async def cmd_set_max(message: Message):
         user_filters[user_id].pop("exact_amount", None)
         user_filters[user_id]["max_amount"] = amount
         
-        await safe_send_message(message, f"✅ Макс. сумма: {amount:,.0f}₽")
+        await safe_send_message(message, f"✅ Установлена максимальная сумма: {amount:,.0f}₽")
     except ValueError:
-        await safe_send_message(message, "❌ Введите число")
+        await safe_send_message(message, "❌ Введите корректное число")
 
 @dp.message(Command("set_spread"))
 async def cmd_set_spread(message: Message):
@@ -885,9 +921,9 @@ async def cmd_set_spread(message: Message):
         
         user_filters[user_id]["min_spread"] = spread
         
-        await safe_send_message(message, f"✅ Мин. спред: {spread}%")
+        await safe_send_message(message, f"✅ Установлен минимальный спред: {spread}%")
     except ValueError:
-        await safe_send_message(message, "❌ Введите число")
+        await safe_send_message(message, "❌ Введите корректное число")
 
 @dp.message(Command("add_blacklist"))
 async def cmd_add_blacklist(message: Message):
@@ -895,10 +931,11 @@ async def cmd_add_blacklist(message: Message):
     if len(args) != 2:
         await safe_send_message(
             message, 
-            "❌ Использование: /add_blacklist <ник>\n"
+            "❌ Использование: /add_blacklist <ник мерчанта>\n"
             "Пример: /add_blacklist Мошенник\n"
             "Пример с кавычками: /add_blacklist \"ALL FOR ALL\"\n\n"
-            "⚠️ Работает только с никами мерчантов (API не передает описания)"
+            "⚠️ Черный список работает ТОЛЬКО с никами мерчантов!\n"
+            "Bybit API не передает описания/условия, поэтому фильтр по ним невозможен."
         )
         return
     
@@ -914,11 +951,14 @@ async def cmd_add_blacklist(message: Message):
         user_filters[user_id]["blacklist"].append(word)
         await safe_send_message(
             message, 
-            f"✅ Добавлен в черный список: {word}\n"
-            f"Объявления с этим ником не будут показываться"
+            f"✅ Добавлено в ЧЕРНЫЙ список: {word}\n"
+            f"Теперь бот НЕ будет показывать объявления мерчантов с этим словом в нике\n"
+            f"(проверяется только ник мерчанта)\n\n"
+            f"⚠️ Напоминание: черный список НЕ фильтрует описание/условия объявлений,\n"
+            f"так как Bybit API не предоставляет эту информацию в публичных объявлениях."
         )
     else:
-        await safe_send_message(message, f"⚠️ {word} уже в черном списке")
+        await safe_send_message(message, f"⚠️ Слово '{word}' уже в черном списке")
 
 @dp.message(Command("remove_blacklist"))
 async def cmd_remove_blacklist(message: Message):
@@ -935,11 +975,11 @@ async def cmd_remove_blacklist(message: Message):
     
     if word in user_filters[user_id]["blacklist"]:
         user_filters[user_id]["blacklist"].remove(word)
-        await safe_send_message(message, f"✅ Удален из черного списка: {word}")
+        await safe_send_message(message, f"✅ Удалено из черного списка: {word}")
         if not user_filters[user_id]["blacklist"]:
             del user_filters[user_id]["blacklist"]
     else:
-        await safe_send_message(message, f"⚠️ {word} не найден в черном списке")
+        await safe_send_message(message, f"⚠️ Слово '{word}' не найдено в черном списке")
 
 
 async def on_startup():
