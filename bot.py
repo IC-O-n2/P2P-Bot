@@ -63,6 +63,7 @@ class P2POffer:
     is_verified: bool
     item_id: str
     user_id: str
+    user_mask_id: str  # Добавляем поле userMaskId
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -172,6 +173,7 @@ class BybitP2PClient:
                 
                 item_id = str(item.get("itemId", ""))
                 user_id = str(item.get("uid", ""))
+                user_mask_id = str(item.get("userMaskId", ""))  # Получаем userMaskId
                 
                 offer = P2POffer(
                     side=side,
@@ -185,7 +187,8 @@ class BybitP2PClient:
                     merchant_name=item.get("nickName", "Аноним"),
                     is_verified=item.get("isVerified", False),
                     item_id=item_id,
-                    user_id=user_id
+                    user_id=user_id,
+                    user_mask_id=user_mask_id  # Сохраняем userMaskId
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
@@ -277,11 +280,11 @@ class P2PArbitrageBot:
         
         return True, "OK"
     
-    def _generate_profile_url(self, user_id: str) -> str:
-        """Генерирует ссылку на профиль пользователя Bybit"""
-        if not user_id or user_id == "0" or user_id == "":
+    def _generate_profile_url(self, user_mask_id: str) -> str:
+        """Генерирует ссылку на профиль пользователя Bybit используя userMaskId"""
+        if not user_mask_id or user_mask_id == "0" or user_mask_id == "":
             return "Ссылка недоступна"
-        return f"https://www.bybit.com/ru-RU/p2p/profile/{user_id}/USDT/RUB/item"
+        return f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item"
     
     def _generate_order_url(self, item_id: str) -> str:
         """Генерирует ссылку на ордер Bybit"""
@@ -454,24 +457,24 @@ class P2PArbitrageBot:
         trade_amount = min(signal.seller.max_amount, signal.buyer.max_amount)
         usdt_amount = trade_amount / signal.seller.price if signal.seller.price > 0 else 0
         
-        # Генерируем ссылки на профили (простой текст, без HTML)
-        seller_profile_url = self._generate_profile_url(signal.seller.user_id)
-        buyer_profile_url = self._generate_profile_url(signal.buyer.user_id)
+        # Генерируем ссылки на профили используя user_mask_id (как в bot_links.py)
+        seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
+        buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
         
-        # Формируем сообщение в нужном формате (без HTML ссылок)
+        # Формируем сообщение с обычными текстовыми ссылками (без HTML)
         message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
 
 🟢 ПРОДАВЕЦ (SELLER)
 • Курс: {signal.seller.price:.2f}₽
 • Лимиты: {format_number(signal.seller.min_amount)} - {format_number(signal.seller.max_amount)}₽
 • Мерчант: {signal.seller.merchant_name} {'❌' if not signal.seller.is_verified else '✅'}
-{seller_profile_url}
+• Ссылка на профиль: {seller_profile_url}
 
 🔴 ПОКУПАТЕЛЬ (BUYER)
 • Курс: {signal.buyer.price:.2f}₽
 • Лимиты: {format_number(signal.buyer.min_amount)} - {format_number(signal.buyer.max_amount)}₽
 • Мерчант: {signal.buyer.merchant_name} {'❌' if not signal.buyer.is_verified else '✅'}
-{buyer_profile_url}
+• Ссылка на профиль: {buyer_profile_url}
 
 📊 РАСЧЕТ ПРИБЫЛИ
 • Спред: {signal.spread:.2f}%
@@ -948,4 +951,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
