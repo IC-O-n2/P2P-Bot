@@ -12,6 +12,7 @@ from decimal import Decimal
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 import html
+import re
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Message, BotCommand
@@ -23,9 +24,9 @@ from dotenv import load_dotenv
 # Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования - более подробный уровень
+# Настройка логирования
 logging.basicConfig(
-    level=logging.DEBUG,  # Меняем на DEBUG для более детальных логов
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ class BybitP2PClient:
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = "https://api.bybit.com"
+        self.verified_cache = {}  # Кэш для верификации
     
     def _post_signed(self, path: str, payload: dict) -> dict:
         """Выполняет подписанный POST запрос к Bybit API"""
@@ -133,6 +135,47 @@ class BybitP2PClient:
             logger.error(f"Ошибка парсинга JSON: {error}")
             return {}
     
+    def _check_user_verified(self, user_mask_id: str) -> bool:
+        """Проверяет верификацию пользователя через другие методы"""
+        if not user_mask_id:
+            return False
+        
+        # Проверяем кэш
+        if user_mask_id in self.verified_cache:
+            return self.verified_cache[user_mask_id]
+        
+        # Пытаемся получить информацию о пользователе
+        try:
+            # Запрашиваем профиль пользователя
+            result = self._post_signed(
+                "/v5/p2p/user/detail",
+                {
+                    "userMaskId": user_mask_id
+                }
+            )
+            
+            # Проверяем статус верификации в ответе
+            user_data = result.get("result", {})
+            is_verified = False
+            
+            # Проверяем разные поля
+            if "isVerified" in user_data:
+                is_verified = bool(user_data.get("isVerified", False))
+            elif "verified" in user_data:
+                is_verified = bool(user_data.get("verified", False))
+            elif "userStatus" in user_data:
+                status = user_data.get("userStatus", "")
+                is_verified = "verified" in str(status).lower()
+            
+            # Сохраняем в кэш
+            self.verified_cache[user_mask_id] = is_verified
+            logger.debug(f"Проверка верификации для {user_mask_id}: {is_verified}")
+            return is_verified
+            
+        except Exception as e:
+            logger.warning(f"Не удалось проверить верификацию для {user_mask_id}: {e}")
+            return False
+    
     def get_online_ads(self, side: str, page: int = 1, size: int = 50) -> List[P2POffer]:
         """Получает P2P объявления с Bybit"""
         side_map = {"BUY": 0, "SELL": 1}
@@ -157,10 +200,6 @@ class BybitP2PClient:
         if not items:
             return []
         
-        # Логируем первый элемент для отладки
-        if items:
-            logger.debug(f"Первый элемент ответа: {json.dumps(items[0], indent=2, ensure_ascii=False)[:500]}")
-        
         offers = []
         for idx, item in enumerate(items):
             try:
@@ -179,40 +218,32 @@ class BybitP2PClient:
                 user_id = str(item.get("uid", ""))
                 user_mask_id = str(item.get("userMaskId", ""))
                 
-                # ПРОВЕРЯЕМ ВСЕ ВОЗМОЖНЫЕ ПОЛЯ ДЛЯ ВЕРИФИКАЦИИ
+                # Пытаемся определить верификацию из доступных полей
                 is_verified = False
                 
-                # Проверяем разные варианты названий поля
+                # Проверяем наличие значка верификации в описании
+                description = item.get("description", "")
+                if "✅" in description or "верифицирован" in description.lower():
+                    is_verified = True
+                    logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: верифицирован по описанию")
+                
+                # Проверяем наличие других полей
                 if "isVerified" in item:
                     is_verified = bool(item.get("isVerified", False))
-                    logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified={is_verified} (из isVerified)")
+                    logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: isVerified={is_verified}")
                 elif "verified" in item:
                     is_verified = bool(item.get("verified", False))
-                    logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified={is_verified} (из verified)")
-                elif "isVerifiedMerchant" in item:
-                    is_verified = bool(item.get("isVerifiedMerchant", False))
-                    logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified={is_verified} (из isVerifiedMerchant)")
-                else:
-                    # Если нет поля, пытаемся найти по другим признакам
-                    # Например, может быть поле userStatus или другие
-                    user_status = item.get("userStatus", "")
-                    if user_status and "verified" in str(user_status).lower():
+                    logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: verified={is_verified}")
+                elif "userStatus" in item:
+                    status = str(item.get("userStatus", ""))
+                    if "verified" in status.lower() or "1" in status:
                         is_verified = True
-                        logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified=True (из userStatus={user_status})")
-                    else:
-                        # Проверяем наличие других полей, которые могут указывать на верификацию
-                        is_merchant = item.get("isMerchant", False)
-                        if is_merchant:
-                            # Если это мерчант, скорее всего верифицирован
-                            is_verified = True
-                            logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified=True (isMerchant=True)")
-                        else:
-                            logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified=False (поля не найдены)")
+                        logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: верифицирован по userStatus={status}")
                 
-                # Дополнительное логирование всех полей для первого мерчанта
-                if idx == 0:
-                    logger.info(f"Доступные поля в ответе: {list(item.keys())}")
-                    logger.info(f"Значение isVerified: {item.get('isVerified', 'НЕТ ТАКОГО ПОЛЯ')}")
+                # Если не нашли, пытаемся проверить через отдельный запрос
+                if not is_verified and user_mask_id and user_mask_id != "":
+                    is_verified = self._check_user_verified(user_mask_id)
+                    logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: проверка через API = {is_verified}")
                 
                 offer = P2POffer(
                     side=side,
@@ -221,7 +252,7 @@ class BybitP2PClient:
                     min_amount=min_amount,
                     max_amount=max_amount,
                     payment_methods=payment_methods,
-                    description=item.get("description", ""),
+                    description=description,
                     link="",
                     merchant_name=item.get("nickName", "Аноним"),
                     is_verified=bool(is_verified),
@@ -234,8 +265,8 @@ class BybitP2PClient:
                 logger.warning(f"Ошибка парсинга объявления #{idx}: {e}")
                 continue
         
-        logger.info(f"Получено {len(offers)} объявлений для {side}")
-        logger.info(f"Из них верифицированных: {sum(1 for o in offers if o.is_verified)}")
+        verified_count = sum(1 for o in offers if o.is_verified)
+        logger.info(f"Получено {len(offers)} объявлений для {side}, из них верифицированных: {verified_count}")
         return offers
 
 class P2PArbitrageBot:
@@ -288,7 +319,7 @@ class P2PArbitrageBot:
         
         # Проверка верификации
         if filters.get("only_verified", False) and not offer.is_verified:
-            return False, f"Мерчант {offer.merchant_name} не верифицирован (is_verified={offer.is_verified})"
+            return False, f"Мерчант {offer.merchant_name} не верифицирован"
         
         # Проверка суммы
         if filters.get("exact_amount"):
@@ -345,22 +376,17 @@ class P2PArbitrageBot:
         # Фильтруем продавцов и покупателей по условиям
         filtered_sellers = []
         for seller in sellers:
-            passes, reason = self._check_offer_conditions(seller, user_filters)
+            passes, _ = self._check_offer_conditions(seller, user_filters)
             if passes:
                 filtered_sellers.append(seller)
-            else:
-                logger.debug(f"Seller {seller.merchant_name} пропущен: {reason}")
         
         filtered_buyers = []
         for buyer in buyers:
-            passes, reason = self._check_offer_conditions(buyer, user_filters)
+            passes, _ = self._check_offer_conditions(buyer, user_filters)
             if passes:
                 filtered_buyers.append(buyer)
-            else:
-                logger.debug(f"Buyer {buyer.merchant_name} пропущен: {reason}")
         
         if not filtered_sellers or not filtered_buyers:
-            logger.info(f"После фильтрации: sellers={len(filtered_sellers)}, buyers={len(filtered_buyers)}")
             return []
         
         # Сортируем продавцов по возрастанию цены (самые дешевые сверху)
@@ -478,7 +504,7 @@ class P2PArbitrageBot:
                                 await self._send_signal(user_id, signal)
                                 sent_signals[user_id][signal.signal_id] = datetime.now()
                                 sent_count += 1
-                                logger.info(f"Отправлен сигнал #{sent_count}: SELL={signal.seller.merchant_name} (verified={signal.seller.is_verified}) {signal.seller.price:.2f}₽, BUY={signal.buyer.merchant_name} (verified={signal.buyer.is_verified}) {signal.buyer.price:.2f}₽, прибыль={signal.profit_rub:.2f}₽")
+                                logger.info(f"Отправлен сигнал #{sent_count}: SELL={signal.seller.merchant_name} {signal.seller.price:.2f}₽, BUY={signal.buyer.merchant_name} {signal.buyer.price:.2f}₽, прибыль={signal.profit_rub:.2f}₽")
                                 await asyncio.sleep(4)
                             else:
                                 skipped_count += 1
@@ -781,7 +807,9 @@ async def cmd_only_verified(message: Message):
         f"Теперь бот будет {'показывать только' if user_filters[user_id]['only_verified'] else 'показывать всех'} верифицированных мерчантов."
     )
 
-# --- Команды для настройки фильтров ---@dp.message(Command("set_exact"))
+# --- Команды для настройки фильтров ---
+
+@dp.message(Command("set_exact"))
 async def cmd_set_exact(message: Message):
     try:
         args = message.text.split()
