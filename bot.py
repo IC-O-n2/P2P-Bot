@@ -11,8 +11,6 @@ import time
 from decimal import Decimal
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-import html
-import re
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Message, BotCommand
@@ -61,7 +59,6 @@ class P2POffer:
     description: str
     link: str
     merchant_name: str
-    is_verified: bool
     item_id: str
     user_id: str
     user_mask_id: str
@@ -86,7 +83,6 @@ class BybitP2PClient:
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = "https://api.bybit.com"
-        self.verified_cache = {}  # Кэш для верификации
     
     def _post_signed(self, path: str, payload: dict) -> dict:
         """Выполняет подписанный POST запрос к Bybit API"""
@@ -135,47 +131,6 @@ class BybitP2PClient:
             logger.error(f"Ошибка парсинга JSON: {error}")
             return {}
     
-    def _check_user_verified(self, user_mask_id: str) -> bool:
-        """Проверяет верификацию пользователя через другие методы"""
-        if not user_mask_id:
-            return False
-        
-        # Проверяем кэш
-        if user_mask_id in self.verified_cache:
-            return self.verified_cache[user_mask_id]
-        
-        # Пытаемся получить информацию о пользователе
-        try:
-            # Запрашиваем профиль пользователя
-            result = self._post_signed(
-                "/v5/p2p/user/detail",
-                {
-                    "userMaskId": user_mask_id
-                }
-            )
-            
-            # Проверяем статус верификации в ответе
-            user_data = result.get("result", {})
-            is_verified = False
-            
-            # Проверяем разные поля
-            if "isVerified" in user_data:
-                is_verified = bool(user_data.get("isVerified", False))
-            elif "verified" in user_data:
-                is_verified = bool(user_data.get("verified", False))
-            elif "userStatus" in user_data:
-                status = user_data.get("userStatus", "")
-                is_verified = "verified" in str(status).lower()
-            
-            # Сохраняем в кэш
-            self.verified_cache[user_mask_id] = is_verified
-            logger.debug(f"Проверка верификации для {user_mask_id}: {is_verified}")
-            return is_verified
-            
-        except Exception as e:
-            logger.warning(f"Не удалось проверить верификацию для {user_mask_id}: {e}")
-            return False
-    
     def get_online_ads(self, side: str, page: int = 1, size: int = 50) -> List[P2POffer]:
         """Получает P2P объявления с Bybit"""
         side_map = {"BUY": 0, "SELL": 1}
@@ -201,7 +156,7 @@ class BybitP2PClient:
             return []
         
         offers = []
-        for idx, item in enumerate(items):
+        for item in items:
             try:
                 price = float(item.get("price", 0))
                 min_amount = float(item.get("minAmount", 0))
@@ -218,33 +173,6 @@ class BybitP2PClient:
                 user_id = str(item.get("uid", ""))
                 user_mask_id = str(item.get("userMaskId", ""))
                 
-                # Пытаемся определить верификацию из доступных полей
-                is_verified = False
-                
-                # Проверяем наличие значка верификации в описании
-                description = item.get("description", "")
-                if "✅" in description or "верифицирован" in description.lower():
-                    is_verified = True
-                    logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: верифицирован по описанию")
-                
-                # Проверяем наличие других полей
-                if "isVerified" in item:
-                    is_verified = bool(item.get("isVerified", False))
-                    logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: isVerified={is_verified}")
-                elif "verified" in item:
-                    is_verified = bool(item.get("verified", False))
-                    logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: verified={is_verified}")
-                elif "userStatus" in item:
-                    status = str(item.get("userStatus", ""))
-                    if "verified" in status.lower() or "1" in status:
-                        is_verified = True
-                        logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: верифицирован по userStatus={status}")
-                
-                # Если не нашли, пытаемся проверить через отдельный запрос
-                if not is_verified and user_mask_id and user_mask_id != "":
-                    is_verified = self._check_user_verified(user_mask_id)
-                    logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: проверка через API = {is_verified}")
-                
                 offer = P2POffer(
                     side=side,
                     price=price,
@@ -252,21 +180,19 @@ class BybitP2PClient:
                     min_amount=min_amount,
                     max_amount=max_amount,
                     payment_methods=payment_methods,
-                    description=description,
+                    description=item.get("description", ""),
                     link="",
                     merchant_name=item.get("nickName", "Аноним"),
-                    is_verified=bool(is_verified),
                     item_id=item_id,
                     user_id=user_id,
                     user_mask_id=user_mask_id
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
-                logger.warning(f"Ошибка парсинга объявления #{idx}: {e}")
+                logger.warning(f"Ошибка парсинга объявления: {e}")
                 continue
         
-        verified_count = sum(1 for o in offers if o.is_verified)
-        logger.info(f"Получено {len(offers)} объявлений для {side}, из них верифицированных: {verified_count}")
+        logger.info(f"Получено {len(offers)} объявлений для {side}")
         return offers
 
 class P2PArbitrageBot:
@@ -316,10 +242,6 @@ class P2PArbitrageBot:
         """Проверка условий мейкера для объявления"""
         if not filters:
             return True, "OK"
-        
-        # Проверка верификации
-        if filters.get("only_verified", False) and not offer.is_verified:
-            return False, f"Мерчант {offer.merchant_name} не верифицирован"
         
         # Проверка суммы
         if filters.get("exact_amount"):
@@ -536,23 +458,19 @@ class P2PArbitrageBot:
         seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
         
-        # Определяем статус верификации
-        seller_verified = "✅" if signal.seller.is_verified else "❌"
-        buyer_verified = "✅" if signal.buyer.is_verified else "❌"
-        
-        # Формируем сообщение
+        # Формируем сообщение БЕЗ индикатора верификации
         message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
 
 🟢 ПРОДАВЕЦ (SELLER)
 • Курс: {signal.seller.price:.2f}₽
 • Лимиты: {format_number(signal.seller.min_amount)} - {format_number(signal.seller.max_amount)}₽
-• Мерчант: {signal.seller.merchant_name} {seller_verified}
+• Мерчант: {signal.seller.merchant_name}
 • Ссылка на профиль: {seller_profile_url}
 
 🔴 ПОКУПАТЕЛЬ (BUYER)
 • Курс: {signal.buyer.price:.2f}₽
 • Лимиты: {format_number(signal.buyer.min_amount)} - {format_number(signal.buyer.max_amount)}₽
-• Мерчант: {signal.buyer.merchant_name} {buyer_verified}
+• Мерчант: {signal.buyer.merchant_name}
 • Ссылка на профиль: {buyer_profile_url}
 
 📊 РАСЧЕТ ПРИБЫЛИ
@@ -582,8 +500,6 @@ class P2PArbitrageBot:
         settings.append("📋 <b>Текущие настройки фильтров:</b>")
         settings.append("")
         
-        if filters.get("only_verified"):
-            settings.append("• ✅ Только верифицированные мерчанты")
         if filters.get("exact_amount"):
             settings.append(f"• Точная сумма: {filters['exact_amount']:.0f}₽")
         if filters.get("min_amount"):
@@ -615,7 +531,6 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="stop_monitoring", description="⏹ Остановить мониторинг"),
         BotCommand(command="clear_filters", description="🧹 Очистить все фильтры"),
         BotCommand(command="help", description="❓ Помощь по настройке фильтров"),
-        BotCommand(command="only_verified", description="✅ Только верифицированные мерчанты"),
         BotCommand(command="start", description="🚀 Главное меню"),
     ]
     await bot.set_my_commands(commands)
@@ -653,7 +568,6 @@ async def cmd_start(message: Message):
 /start_monitoring - Запустить мониторинг
 /stop_monitoring - Остановить мониторинг
 /clear_filters - Очистить все фильтры
-/only_verified - Только верифицированные мерчанты
 /help - Помощь
 
 <b>Как это работает:</b>
@@ -693,10 +607,7 @@ async def cmd_help(message: Message):
 4. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
 
-5. <b>Верификация</b>
-   /only_verified - показывать только верифицированных мерчантов
-
-6. <b>Управление</b>
+5. <b>Управление</b>
    /start_monitoring - запуск поиска
    /stop_monitoring - остановка поиска
    /status - текущий статус
@@ -708,8 +619,7 @@ async def cmd_help(message: Message):
 3. /set_spread 0.5
 4. /add_blacklist СБП
 5. /add_whitelist Т-Банк
-6. /only_verified
-7. /start_monitoring
+6. /start_monitoring
 
 <b>Как работают списки:</b>
 • <b>Черный список</b> - запрещает показывать объявления с этими словами
@@ -788,24 +698,6 @@ async def cmd_clear_filters(message: Message):
     user_subscriptions[user_id] = False
     sent_signals[user_id] = {}
     await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен.")
-
-@dp.message(Command("only_verified"))
-async def cmd_only_verified(message: Message):
-    """Включить фильтр только верифицированных мерчантов"""
-    user_id = message.from_user.id
-    if user_id not in user_filters:
-        user_filters[user_id] = {}
-    
-    # Переключаем фильтр
-    current = user_filters[user_id].get("only_verified", False)
-    user_filters[user_id]["only_verified"] = not current
-    
-    status = "включен" if user_filters[user_id]["only_verified"] else "выключен"
-    await safe_send_message(
-        message, 
-        f"✅ Фильтр 'Только верифицированные мерчанты' {status}.\n"
-        f"Теперь бот будет {'показывать только' if user_filters[user_id]['only_verified'] else 'показывать всех'} верифицированных мерчантов."
-    )
 
 # --- Команды для настройки фильтров ---
 
