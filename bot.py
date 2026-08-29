@@ -826,7 +826,7 @@ async def cmd_start_monitoring(message: Message):
         f"✅ Мониторинг запущен!\n"
         f"Бот будет присылать сигналы при нахождении выгодных связок.\n"
         f"⏱ Задержка между сигналами: {delay}с\n"
-        f"Для остановки используйте /stop_monitoring"
+        f"Для остановки используйте: \n/stop_monitoring"
     )
 
 @dp.message(Command("stop_monitoring"))
@@ -1083,3 +1083,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
