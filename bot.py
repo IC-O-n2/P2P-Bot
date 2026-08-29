@@ -23,9 +23,9 @@ from dotenv import load_dotenv
 # Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования
+# Настройка логирования - более подробный уровень
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Меняем на DEBUG для более детальных логов
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -157,8 +157,12 @@ class BybitP2PClient:
         if not items:
             return []
         
+        # Логируем первый элемент для отладки
+        if items:
+            logger.debug(f"Первый элемент ответа: {json.dumps(items[0], indent=2, ensure_ascii=False)[:500]}")
+        
         offers = []
-        for item in items:
+        for idx, item in enumerate(items):
             try:
                 price = float(item.get("price", 0))
                 min_amount = float(item.get("minAmount", 0))
@@ -175,16 +179,40 @@ class BybitP2PClient:
                 user_id = str(item.get("uid", ""))
                 user_mask_id = str(item.get("userMaskId", ""))
                 
-                # Проверяем наличие isVerified в разных форматах
-                is_verified = item.get("isVerified", False)
-                # Если isVerified нет, пробуем другие возможные поля
-                if not is_verified:
-                    is_verified = item.get("verified", False)
-                    if not is_verified:
-                        is_verified = item.get("isVerifiedMerchant", False)
+                # ПРОВЕРЯЕМ ВСЕ ВОЗМОЖНЫЕ ПОЛЯ ДЛЯ ВЕРИФИКАЦИИ
+                is_verified = False
                 
-                # Логируем для отладки
-                logger.debug(f"Мерчант {item.get('nickName', 'Unknown')}: isVerified={is_verified}")
+                # Проверяем разные варианты названий поля
+                if "isVerified" in item:
+                    is_verified = bool(item.get("isVerified", False))
+                    logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified={is_verified} (из isVerified)")
+                elif "verified" in item:
+                    is_verified = bool(item.get("verified", False))
+                    logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified={is_verified} (из verified)")
+                elif "isVerifiedMerchant" in item:
+                    is_verified = bool(item.get("isVerifiedMerchant", False))
+                    logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified={is_verified} (из isVerifiedMerchant)")
+                else:
+                    # Если нет поля, пытаемся найти по другим признакам
+                    # Например, может быть поле userStatus или другие
+                    user_status = item.get("userStatus", "")
+                    if user_status and "verified" in str(user_status).lower():
+                        is_verified = True
+                        logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified=True (из userStatus={user_status})")
+                    else:
+                        # Проверяем наличие других полей, которые могут указывать на верификацию
+                        is_merchant = item.get("isMerchant", False)
+                        if is_merchant:
+                            # Если это мерчант, скорее всего верифицирован
+                            is_verified = True
+                            logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified=True (isMerchant=True)")
+                        else:
+                            logger.debug(f"Мерчант #{idx} {item.get('nickName', 'Unknown')}: isVerified=False (поля не найдены)")
+                
+                # Дополнительное логирование всех полей для первого мерчанта
+                if idx == 0:
+                    logger.info(f"Доступные поля в ответе: {list(item.keys())}")
+                    logger.info(f"Значение isVerified: {item.get('isVerified', 'НЕТ ТАКОГО ПОЛЯ')}")
                 
                 offer = P2POffer(
                     side=side,
@@ -196,17 +224,18 @@ class BybitP2PClient:
                     description=item.get("description", ""),
                     link="",
                     merchant_name=item.get("nickName", "Аноним"),
-                    is_verified=bool(is_verified),  # Приводим к bool
+                    is_verified=bool(is_verified),
                     item_id=item_id,
                     user_id=user_id,
                     user_mask_id=user_mask_id
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
-                logger.warning(f"Ошибка парсинга объявления: {e}")
+                logger.warning(f"Ошибка парсинга объявления #{idx}: {e}")
                 continue
         
         logger.info(f"Получено {len(offers)} объявлений для {side}")
+        logger.info(f"Из них верифицированных: {sum(1 for o in offers if o.is_verified)}")
         return offers
 
 class P2PArbitrageBot:
@@ -259,7 +288,7 @@ class P2PArbitrageBot:
         
         # Проверка верификации
         if filters.get("only_verified", False) and not offer.is_verified:
-            return False, "Мерчант не верифицирован"
+            return False, f"Мерчант {offer.merchant_name} не верифицирован (is_verified={offer.is_verified})"
         
         # Проверка суммы
         if filters.get("exact_amount"):
@@ -316,17 +345,22 @@ class P2PArbitrageBot:
         # Фильтруем продавцов и покупателей по условиям
         filtered_sellers = []
         for seller in sellers:
-            passes, _ = self._check_offer_conditions(seller, user_filters)
+            passes, reason = self._check_offer_conditions(seller, user_filters)
             if passes:
                 filtered_sellers.append(seller)
+            else:
+                logger.debug(f"Seller {seller.merchant_name} пропущен: {reason}")
         
         filtered_buyers = []
         for buyer in buyers:
-            passes, _ = self._check_offer_conditions(buyer, user_filters)
+            passes, reason = self._check_offer_conditions(buyer, user_filters)
             if passes:
                 filtered_buyers.append(buyer)
+            else:
+                logger.debug(f"Buyer {buyer.merchant_name} пропущен: {reason}")
         
         if not filtered_sellers or not filtered_buyers:
+            logger.info(f"После фильтрации: sellers={len(filtered_sellers)}, buyers={len(filtered_buyers)}")
             return []
         
         # Сортируем продавцов по возрастанию цены (самые дешевые сверху)
@@ -444,7 +478,7 @@ class P2PArbitrageBot:
                                 await self._send_signal(user_id, signal)
                                 sent_signals[user_id][signal.signal_id] = datetime.now()
                                 sent_count += 1
-                                logger.info(f"Отправлен сигнал #{sent_count}: SELL={signal.seller.merchant_name} {signal.seller.price:.2f}₽, BUY={signal.buyer.merchant_name} {signal.buyer.price:.2f}₽, прибыль={signal.profit_rub:.2f}₽")
+                                logger.info(f"Отправлен сигнал #{sent_count}: SELL={signal.seller.merchant_name} (verified={signal.seller.is_verified}) {signal.seller.price:.2f}₽, BUY={signal.buyer.merchant_name} (verified={signal.buyer.is_verified}) {signal.buyer.price:.2f}₽, прибыль={signal.profit_rub:.2f}₽")
                                 await asyncio.sleep(4)
                             else:
                                 skipped_count += 1
@@ -747,9 +781,7 @@ async def cmd_only_verified(message: Message):
         f"Теперь бот будет {'показывать только' if user_filters[user_id]['only_verified'] else 'показывать всех'} верифицированных мерчантов."
     )
 
-# --- Команды для настройки фильтров ---
-
-@dp.message(Command("set_exact"))
+# --- Команды для настройки фильтров ---@dp.message(Command("set_exact"))
 async def cmd_set_exact(message: Message):
     try:
         args = message.text.split()
