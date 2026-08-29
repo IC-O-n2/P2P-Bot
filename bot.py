@@ -258,6 +258,16 @@ class P2PArbitrageBot:
         if not filters:
             return True, "OK"
         
+        # Проверка черного списка (проверяем ВСЕ поля)
+        blacklist = filters.get("blacklist", [])
+        if blacklist:
+            # Собираем все текстовые поля объявления в одну строку для проверки
+            text_to_check = f"{offer.merchant_name} {offer.description} {offer.user_id} {offer.user_mask_id} {' '.join(offer.payment_methods)}".lower()
+            
+            for word in blacklist:
+                if word.lower() in text_to_check:
+                    return False, f"Найдено запрещенное слово '{word}' в объявлении мерчанта {offer.merchant_name}"
+        
         # Проверка суммы
         if filters.get("exact_amount"):
             if not (offer.min_amount <= filters["exact_amount"] <= offer.max_amount):
@@ -271,15 +281,10 @@ class P2PArbitrageBot:
             if offer.min_amount > filters["max_amount"]:
                 return False, f"Мин. сумма {offer.min_amount:.0f}₽ > {filters['max_amount']:.0f}₽"
         
-        # Проверка текстовых условий
-        description_lower = offer.description.lower()
-        
-        for word in filters.get("blacklist", []):
-            if word.lower() in description_lower:
-                return False, f"Найдено запрещенное слово: {word}"
-        
+        # Проверка белого списка (только для описания)
         whitelist = filters.get("whitelist", [])
         if whitelist:
+            description_lower = offer.description.lower()
             found = any(word.lower() in description_lower for word in whitelist)
             if not found:
                 return False, f"Нет обязательных слов из: {', '.join(whitelist)}"
@@ -566,7 +571,7 @@ class P2PArbitrageBot:
         if filters.get("min_spread"):
             settings.append(f"• Мин. спред: {filters['min_spread']}%")
         if filters.get("blacklist"):
-            settings.append(f"• Черный список: {', '.join(filters['blacklist'])}")
+            settings.append(f"• Черный список (ник/слова): {', '.join(filters['blacklist'])}")
         if filters.get("whitelist"):
             settings.append(f"• Белый список: {', '.join(filters['whitelist'])}")
         if filters.get("payment_methods"):
@@ -655,6 +660,7 @@ async def cmd_help(message: Message):
 
 2. <b>Черный список (исключаем)</b>
    /add_blacklist СБП - НЕ показывать объявления со словом "СБП"
+   /add_blacklist ИмяМерчанта - НЕ показывать объявления этого мерчанта
    /remove_blacklist СБП - убрать из черного списка
 
 3. <b>Белый список (только эти)</b>
@@ -675,15 +681,19 @@ async def cmd_help(message: Message):
 2. /set_max 10000
 3. /set_spread 0.5
 4. /add_blacklist СБП
-5. /add_whitelist Т-Банк
-6. /start_monitoring
+5. /add_blacklist Мошенник
+6. /add_whitelist Т-Банк
+7. /start_monitoring
 
 <b>Как работают списки:</b>
 • <b>Черный список</b> - запрещает показывать объявления с этими словами
-  Пример: если добавить "СБП", бот пропустит все объявления где есть "СБП"
+  Проверяются: ник мерчанта, описание, ID пользователя
+  Пример: если добавить "СБП" - бот пропустит все объявления где есть "СБП"
+  Пример: если добавить "Мошенник" - бот пропустит всех мерчантов с ником "Мошенник"
 
 • <b>Белый список</b> - разрешает показывать ТОЛЬКО объявления с этими словами
-  Пример: если добавить "Т-Банк", бот покажет только объявления с "Т-Банк"
+  Проверяется только описание объявления
+  Пример: если добавить "Т-Банк" - бот покажет только объявления с "Т-Банк"
   
 <b>Важно!</b> Если белый список пуст - бот показывает всё, кроме черного списка.
 Если белый список не пуст - бот показывает ТОЛЬКО то, что есть в белом списке.
@@ -874,7 +884,9 @@ async def cmd_add_blacklist(message: Message):
             message, 
             "❌ Использование: /add_blacklist <слово>\n"
             "Пример: /add_blacklist СБП\n\n"
-            "Это исключит все объявления, где есть слово 'СБП'"
+            "Это исключит все объявления, где есть слово 'СБП'\n"
+            "Также можно добавить ник мерчанта: /add_blacklist Мошенник\n"
+            "Тогда объявления этого мерчанта не будут показываться"
         )
         return
     
@@ -891,7 +903,8 @@ async def cmd_add_blacklist(message: Message):
         await safe_send_message(
             message, 
             f"✅ Добавлено в ЧЕРНЫЙ список: {word}\n"
-            f"Теперь бот НЕ будет показывать объявления с этим словом"
+            f"Теперь бот НЕ будет показывать объявления с этим словом\n"
+            f"(проверяются: ник мерчанта, описание, ID пользователя)"
         )
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' уже в черном списке")
