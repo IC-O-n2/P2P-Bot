@@ -11,6 +11,7 @@ import time
 from decimal import Decimal
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+import re
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Message, BotCommand
@@ -91,6 +92,25 @@ def parse_args_with_quotes(text: str) -> List[str]:
         args.append(current_arg)
     
     return args
+
+# Функция для проверки наличия слова в тексте с учетом границ слов
+def check_word_in_text(word: str, text: str) -> bool:
+    """
+    Проверяет наличие слова в тексте с учетом границ слов.
+    Использует регулярные выражения для точного поиска.
+    """
+    # Экранируем специальные символы в слове
+    escaped_word = re.escape(word)
+    # Создаем паттерн для поиска слова как отдельного слова или части слова
+    # Используем границы слов \b, но также проверяем наличие слова в составе других слов
+    # если слово короткое (до 3 символов), ищем как отдельное слово
+    if len(word) <= 3:
+        pattern = rf'\b{escaped_word}\b'
+    else:
+        # Для длинных слов ищем как часть слова или отдельное слово
+        pattern = rf'{escaped_word}'
+    
+    return bool(re.search(pattern, text, re.IGNORECASE))
 
 # Функция для безопасной отправки сообщений
 async def safe_send_message(message: Message, text: str):
@@ -318,8 +338,14 @@ class P2PArbitrageBot:
             # Собираем все текстовые поля объявления в одну строку для проверки
             text_to_check = f"{offer.merchant_name} {offer.description} {offer.user_id} {offer.user_mask_id} {' '.join(offer.payment_methods)}".lower()
             
+            # Логируем для отладки
+            logger.debug(f"Проверка черного списка для объявления {offer.merchant_name}: {blacklist}")
+            logger.debug(f"Текст для проверки: {text_to_check[:200]}...")
+            
             for word in blacklist:
-                if word.lower() in text_to_check:
+                # Используем улучшенную проверку с регулярными выражениями
+                if check_word_in_text(word, text_to_check):
+                    logger.info(f"Найдено запрещенное слово '{word}' в объявлении мерчанта {offer.merchant_name}")
                     return False, f"Найдено запрещенное слово '{word}' в объявлении мерчанта {offer.merchant_name}"
         
         # Проверка суммы
@@ -697,6 +723,10 @@ async def cmd_help(message: Message):
    /add_blacklist СБП - НЕ показывать объявления со словом "СБП"
    /add_blacklist "Имя Мерчанта" - НЕ показывать объявления этого мерчанта (имя в кавычках)
    /remove_blacklist СБП - убрать из черного списка
+   
+   <b>Важно!</b> Черный список проверяет вхождение слова в текст.
+   Например, если добавить "СБП", будут отфильтрованы все объявления с этим словом,
+   включая фразы "не принимаю СБП", "СБП не работает" и т.д.
 
 3. <b>Платежные системы</b>
    /add_payment Т-Банк - показывать только объявления с этой платежной системой
@@ -727,7 +757,9 @@ async def cmd_help(message: Message):
 <b>Как работает черный список:</b>
 Черный список запрещает показывать объявления с указанными словами.
 Проверяются: ник мерчанта, описание, ID пользователя.
-Пример: если добавить "СБП" - бот пропустит все объявления где есть "СБП"
+Поиск происходит по вхождению слова в текст (регистр не важен).
+Пример: если добавить "СБП" - бот пропустит все объявления где есть "СБП" 
+(включая "не принимаю СБП", "СБП не работает" и т.д.)
 Пример: если добавить "Мошенник" - бот пропустит всех мерчантов с ником "Мошенник"
 
 <b>Как работают платежные системы:</b>
