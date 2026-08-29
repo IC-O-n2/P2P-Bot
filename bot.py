@@ -47,6 +47,60 @@ user_subscriptions: Dict[int, bool] = {}
 # Хранилище для отправленных сигналов (с временем)
 sent_signals: Dict[int, Dict[str, datetime]] = {}
 
+# Вспомогательная функция для парсинга аргументов с поддержкой кавычек
+def parse_args_with_quotes(text: str) -> List[str]:
+    """
+    Парсит строку аргументов, поддерживая кавычки для фраз с пробелами.
+    Поддерживает как одинарные ('), так и двойные (") кавычки.
+    """
+    args = []
+    current_arg = ""
+    in_quotes = False
+    quote_char = None
+    
+    i = 0
+    while i < len(text):
+        char = text[i]
+        
+        # Проверяем начало или конец кавычек
+        if char in ('"', "'") and (i == 0 or text[i-1] != '\\'):
+            if not in_quotes:
+                # Начало кавычек
+                in_quotes = True
+                quote_char = char
+            elif quote_char == char:
+                # Конец кавычек
+                in_quotes = False
+                quote_char = None
+            i += 1
+            continue
+        
+        if not in_quotes and char == ' ':
+            # Пробел вне кавычек - разделитель аргументов
+            if current_arg:
+                args.append(current_arg)
+                current_arg = ""
+            i += 1
+            continue
+        
+        current_arg += char
+        i += 1
+    
+    # Добавляем последний аргумент
+    if current_arg:
+        args.append(current_arg)
+    
+    return args
+
+# Функция для безопасной отправки сообщений
+async def safe_send_message(message: Message, text: str):
+    """Отправка сообщения с безопасной обработкой HTML"""
+    try:
+        await message.answer(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
+        await message.answer(text.replace('<', '[').replace('>', ']'))
+
 @dataclass
 class P2POffer:
     """Класс для хранения данных P2P-объявления"""
@@ -604,15 +658,6 @@ bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMod
 dp = Dispatcher()
 arbitrage_bot = P2PArbitrageBot(bot)
 
-# Функция для безопасной отправки сообщений
-async def safe_send_message(message: Message, text: str):
-    """Отправка сообщения с безопасной обработкой HTML"""
-    try:
-        await message.answer(text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
-        await message.answer(text.replace('<', '[').replace('>', ']'))
-
 # --- Обработчики команд ---
 
 @dp.message(Command("start"))
@@ -660,11 +705,12 @@ async def cmd_help(message: Message):
 
 2. <b>Черный список (исключаем)</b>
    /add_blacklist СБП - НЕ показывать объявления со словом "СБП"
-   /add_blacklist ИмяМерчанта - НЕ показывать объявления этого мерчанта
+   /add_blacklist "Имя Мерчанта" - НЕ показывать объявления этого мерчанта (имя в кавычках)
    /remove_blacklist СБП - убрать из черного списка
 
 3. <b>Белый список (только эти)</b>
    /add_whitelist Т-Банк - ПОКАЗЫВАТЬ только объявления со словом "Т-Банк"
+   /add_whitelist "Т-Банк" - тоже самое с кавычками
    /remove_whitelist Т-Банк - убрать из белого списка
 
 4. <b>Спред</b>
@@ -676,12 +722,16 @@ async def cmd_help(message: Message):
    /status - текущий статус
    /clear_filters - очистить все фильтры
 
+<b>Важно про кавычки!</b>
+Если вы хотите добавить фразу из нескольких слов (например, имя мерчанта "ALL FOR ALL"), 
+заключите её в кавычки: /add_blacklist "ALL FOR ALL"
+
 <b>Пример настройки:</b>
 1. /set_min 500
 2. /set_max 10000
 3. /set_spread 0.5
 4. /add_blacklist СБП
-5. /add_blacklist Мошенник
+5. /add_blacklist "Мошенник Иван"
 6. /add_whitelist Т-Банк
 7. /start_monitoring
 
@@ -783,7 +833,8 @@ async def cmd_clear_filters(message: Message):
 @dp.message(Command("set_exact"))
 async def cmd_set_exact(message: Message):
     try:
-        args = message.text.split()
+        # Используем новый парсер для поддержки кавычек
+        args = parse_args_with_quotes(message.text)
         if len(args) != 2:
             await safe_send_message(message, "❌ Использование: /set_exact <сумма>\nПример: /set_exact 28000")
             return
@@ -808,7 +859,7 @@ async def cmd_set_exact(message: Message):
 @dp.message(Command("set_min"))
 async def cmd_set_min(message: Message):
     try:
-        args = message.text.split()
+        args = parse_args_with_quotes(message.text)
         if len(args) != 2:
             await safe_send_message(message, "❌ Использование: /set_min <сумма>\nПример: /set_min 25000")
             return
@@ -832,7 +883,7 @@ async def cmd_set_min(message: Message):
 @dp.message(Command("set_max"))
 async def cmd_set_max(message: Message):
     try:
-        args = message.text.split()
+        args = parse_args_with_quotes(message.text)
         if len(args) != 2:
             await safe_send_message(message, "❌ Использование: /set_max <сумма>\nПример: /set_max 30000")
             return
@@ -856,7 +907,7 @@ async def cmd_set_max(message: Message):
 @dp.message(Command("set_spread"))
 async def cmd_set_spread(message: Message):
     try:
-        args = message.text.split()
+        args = parse_args_with_quotes(message.text)
         if len(args) != 2:
             await safe_send_message(message, "❌ Использование: /set_spread <процент>\nПример: /set_spread 0.5")
             return
@@ -878,15 +929,15 @@ async def cmd_set_spread(message: Message):
 
 @dp.message(Command("add_blacklist"))
 async def cmd_add_blacklist(message: Message):
-    args = message.text.split()
+    args = parse_args_with_quotes(message.text)
     if len(args) != 2:
         await safe_send_message(
             message, 
             "❌ Использование: /add_blacklist <слово>\n"
-            "Пример: /add_blacklist СБП\n\n"
-            "Это исключит все объявления, где есть слово 'СБП'\n"
-            "Также можно добавить ник мерчанта: /add_blacklist Мошенник\n"
-            "Тогда объявления этого мерчанта не будут показываться"
+            "Пример: /add_blacklist СБП\n"
+            "Пример с кавычками: /add_blacklist \"Имя Мерчанта\"\n\n"
+            "Это исключит все объявления, где есть указанное слово или фраза\n"
+            "Если добавляете имя мерчанта с пробелами - заключите в кавычки"
         )
         return
     
@@ -911,7 +962,7 @@ async def cmd_add_blacklist(message: Message):
 
 @dp.message(Command("remove_blacklist"))
 async def cmd_remove_blacklist(message: Message):
-    args = message.text.split()
+    args = parse_args_with_quotes(message.text)
     if len(args) != 2:
         await safe_send_message(message, "❌ Использование: /remove_blacklist <слово>\nПример: /remove_blacklist СБП")
         return
@@ -932,13 +983,14 @@ async def cmd_remove_blacklist(message: Message):
 
 @dp.message(Command("add_whitelist"))
 async def cmd_add_whitelist(message: Message):
-    args = message.text.split()
+    args = parse_args_with_quotes(message.text)
     if len(args) != 2:
         await safe_send_message(
             message,
             "❌ Использование: /add_whitelist <слово>\n"
-            "Пример: /add_whitelist Т-Банк\n\n"
-            "Теперь бот будет ПОКАЗЫВАТЬ только объявления с этим словом"
+            "Пример: /add_whitelist Т-Банк\n"
+            "Пример с кавычками: /add_whitelist \"Т-Банк Онлайн\"\n\n"
+            "Теперь бот будет ПОКАЗЫВАТЬ только объявления с этим словом или фразой"
         )
         return
     
@@ -962,7 +1014,7 @@ async def cmd_add_whitelist(message: Message):
 
 @dp.message(Command("remove_whitelist"))
 async def cmd_remove_whitelist(message: Message):
-    args = message.text.split()
+    args = parse_args_with_quotes(message.text)
     if len(args) != 2:
         await safe_send_message(message, "❌ Использование: /remove_whitelist <слово>\nПример: /remove_whitelist Т-Банк")
         return
@@ -983,7 +1035,7 @@ async def cmd_remove_whitelist(message: Message):
 
 @dp.message(Command("add_payment"))
 async def cmd_add_payment(message: Message):
-    args = message.text.split()
+    args = parse_args_with_quotes(message.text)
     if len(args) != 2:
         await safe_send_message(message, "❌ Использование: /add_payment <система>\nПример: /add_payment Т-Банк")
         return
@@ -1004,7 +1056,7 @@ async def cmd_add_payment(message: Message):
 
 @dp.message(Command("remove_payment"))
 async def cmd_remove_payment(message: Message):
-    args = message.text.split()
+    args = parse_args_with_quotes(message.text)
     if len(args) != 2:
         await safe_send_message(message, "❌ Использование: /remove_payment <система>\nПример: /remove_payment Т-Банк")
         return
