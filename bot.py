@@ -332,21 +332,20 @@ class P2PArbitrageBot:
         if not filters:
             return True, "OK"
         
-        # Проверка черного списка (проверяем ВСЕ поля)
+        # Проверка черного списка (только по нику мерчанта)
         blacklist = filters.get("blacklist", [])
         if blacklist:
-            # Собираем все текстовые поля объявления в одну строку для проверки
-            text_to_check = f"{offer.merchant_name} {offer.description} {offer.user_id} {offer.user_mask_id} {' '.join(offer.payment_methods)}".lower()
+            # Проверяем только имя мерчанта
+            merchant_name_lower = offer.merchant_name.lower()
             
             # Логируем для отладки
-            logger.debug(f"Проверка черного списка для объявления {offer.merchant_name}: {blacklist}")
-            logger.debug(f"Текст для проверки: {text_to_check[:200]}...")
+            logger.debug(f"Проверка черного списка для мерчанта {offer.merchant_name}: {blacklist}")
             
             for word in blacklist:
                 # Используем улучшенную проверку с регулярными выражениями
-                if check_word_in_text(word, text_to_check):
-                    logger.info(f"Найдено запрещенное слово '{word}' в объявлении мерчанта {offer.merchant_name}")
-                    return False, f"Найдено запрещенное слово '{word}' в объявлении мерчанта {offer.merchant_name}"
+                if check_word_in_text(word, merchant_name_lower):
+                    logger.info(f"Найдено запрещенное слово '{word}' в нике мерчанта {offer.merchant_name}")
+                    return False, f"Найдено запрещенное слово '{word}' в нике мерчанта {offer.merchant_name}"
         
         # Проверка суммы
         if filters.get("exact_amount"):
@@ -643,7 +642,7 @@ class P2PArbitrageBot:
         if filters.get("min_spread"):
             settings.append(f"• Мин. спред: {filters['min_spread']}%")
         if filters.get("blacklist"):
-            settings.append(f"• Черный список (ник/слова): {', '.join(filters['blacklist'])}")
+            settings.append(f"• Черный список (ники мерчантов): {', '.join(filters['blacklist'])}")
         if filters.get("payment_methods"):
             settings.append(f"• Платежные системы: {', '.join(filters['payment_methods'])}")
         
@@ -719,18 +718,22 @@ async def cmd_help(message: Message):
    /set_min 25000 - минимум 25 000 ₽
    /set_max 30000 - максимум 30 000 ₽
 
-2. <b>Черный список (исключаем)</b>
-   /add_blacklist СБП - НЕ показывать объявления со словом "СБП"
-   /add_blacklist "Имя Мерчанта" - НЕ показывать объявления этого мерчанта (имя в кавычках)
-   /remove_blacklist СБП - убрать из черного списка
+2. <b>Черный список (исключаем по никам мерчантов)</b>
+   /add_blacklist "Имя Мерчанта" - НЕ показывать объявления этого мерчанта
+   /add_blacklist Мошенник - НЕ показывать объявления мерчантов с этим словом в нике
+   /remove_blacklist "Имя Мерчанта" - убрать из черного списка
    
-   <b>Важно!</b> Черный список проверяет вхождение слова в текст.
-   Например, если добавить "СБП", будут отфильтрованы все объявления с этим словом,
-   включая фразы "не принимаю СБП", "СБП не работает" и т.д.
+   <b>⚠️ ВАЖНО:</b> Черный список работает ТОЛЬКО с никами мерчантов!
+   • Bybit API НЕ передает текстовые условия/описания объявлений
+   • Черный список НЕ может фильтровать по описанию или условиям мейкера
+   • Черный список НЕ может фильтровать по платежным системам (для этого есть /add_payment)
+   • Если хотите исключить мерчанта - добавьте его полный ник или часть ника
 
 3. <b>Платежные системы</b>
    /add_payment Т-Банк - показывать только объявления с этой платежной системой
    /remove_payment Т-Банк - убрать фильтр по платежной системе
+   
+   <b>ℹ️ Информация:</b> Платежные системы передаются API и фильтруются корректно
 
 4. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
@@ -742,29 +745,30 @@ async def cmd_help(message: Message):
    /clear_filters - очистить все фильтры
 
 <b>Важно про кавычки!</b>
-Если вы хотите добавить фразу из нескольких слов (например, имя мерчанта "ALL FOR ALL"), 
-заключите её в кавычки: /add_blacklist "ALL FOR ALL"
+Если имя мерчанта состоит из нескольких слов, заключите его в кавычки:
+/add_blacklist "ALL FOR ALL"
+/add_blacklist "Иван Петров"
 
 <b>Пример настройки:</b>
 1. /set_min 500
 2. /set_max 10000
 3. /set_spread 0.5
-4. /add_blacklist СБП
-5. /add_blacklist "Мошенник Иван"
+4. /add_blacklist "Мошенник Иван"
+5. /add_blacklist "ALL FOR ALL"
 6. /add_payment Т-Банк
 7. /start_monitoring
 
 <b>Как работает черный список:</b>
-Черный список запрещает показывать объявления с указанными словами.
-Проверяются: ник мерчанта, описание, ID пользователя.
-Поиск происходит по вхождению слова в текст (регистр не важен).
-Пример: если добавить "СБП" - бот пропустит все объявления где есть "СБП" 
-(включая "не принимаю СБП", "СБП не работает" и т.д.)
-Пример: если добавить "Мошенник" - бот пропустит всех мерчантов с ником "Мошенник"
+• Проверяет только НИК мерчанта
+• Регистр не важен
+• Можно добавить как полное имя, так и часть
+• Пример: /add_blacklist "Мошенник" - исключит всех мерчантов с этим словом в нике
+• Пример: /add_blacklist "ALL FOR ALL" - исключит только этого конкретного мерчанта
 
 <b>Как работают платежные системы:</b>
-Если вы добавили платежные системы, бот будет показывать только объявления с ними.
-Если список платежных систем пуст - бот показывает все объявления.
+• Фильтруют по платежным системам из объявления
+• Если список пуст - показываются все платежные системы
+• Если добавлены системы - показываются только объявления с ними
     """
     await safe_send_message(message, help_text)
 
@@ -950,11 +954,12 @@ async def cmd_add_blacklist(message: Message):
     if len(args) != 2:
         await safe_send_message(
             message, 
-            "❌ Использование: /add_blacklist <слово>\n"
-            "Пример: /add_blacklist СБП\n"
-            "Пример с кавычками: /add_blacklist \"Имя Мерчанта\"\n\n"
-            "Это исключит все объявления, где есть указанное слово или фраза\n"
-            "Если добавляете имя мерчанта с пробелами - заключите в кавычки"
+            "❌ Использование: /add_blacklist <ник мерчанта>\n"
+            "Пример: /add_blacklist Мошенник\n"
+            "Пример с кавычками: /add_blacklist \"ALL FOR ALL\"\n\n"
+            "⚠️ Черный список работает ТОЛЬКО с никами мерчантов!\n"
+            "Bybit API не передает описания/условия, поэтому фильтр по ним невозможен.\n"
+            "Для фильтрации по платежным системам используйте /add_payment"
         )
         return
     
@@ -971,8 +976,10 @@ async def cmd_add_blacklist(message: Message):
         await safe_send_message(
             message, 
             f"✅ Добавлено в ЧЕРНЫЙ список: {word}\n"
-            f"Теперь бот НЕ будет показывать объявления с этим словом\n"
-            f"(проверяются: ник мерчанта, описание, ID пользователя)"
+            f"Теперь бот НЕ будет показывать объявления мерчантов с этим словом в нике\n"
+            f"(проверяется только ник мерчанта)\n\n"
+            f"⚠️ Напоминание: черный список НЕ фильтрует описание/условия объявлений,\n"
+            f"так как Bybit API не предоставляет эту информацию в публичных объявлениях."
         )
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' уже в черном списке")
@@ -981,7 +988,7 @@ async def cmd_add_blacklist(message: Message):
 async def cmd_remove_blacklist(message: Message):
     args = parse_args_with_quotes(message.text)
     if len(args) != 2:
-        await safe_send_message(message, "❌ Использование: /remove_blacklist <слово>\nПример: /remove_blacklist СБП")
+        await safe_send_message(message, "❌ Использование: /remove_blacklist <ник>\nПример: /remove_blacklist Мошенник")
         return
     
     word = args[1]
@@ -1015,7 +1022,8 @@ async def cmd_add_payment(message: Message):
     
     if payment not in user_filters[user_id]["payment_methods"]:
         user_filters[user_id]["payment_methods"].append(payment)
-        await safe_send_message(message, f"✅ Добавлена платежная система: {payment}")
+        await safe_send_message(message, f"✅ Добавлена платежная система: {payment}\n"
+                                   f"Теперь бот будет показывать только объявления с этой платежной системой")
     else:
         await safe_send_message(message, f"⚠️ Платежная система '{payment}' уже добавлена")
 
