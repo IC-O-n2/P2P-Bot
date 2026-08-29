@@ -307,30 +307,20 @@ class P2PArbitrageBot:
             logger.error(f"Ошибка при получении объявлений: {e}")
             return []
     
-    def _get_offer_text(self, offer: P2POffer) -> str:
-        """Получает весь текст объявления для проверки"""
-        return f"{offer.merchant_name} {offer.description} {offer.user_id} {offer.user_mask_id} {' '.join(offer.payment_methods)}".lower()
-    
     def _check_offer_conditions(self, offer: P2POffer, filters: Dict) -> Tuple[bool, str]:
         """Проверка условий мейкера для объявления"""
         if not filters:
             return True, "OK"
         
-        offer_text = self._get_offer_text(offer)
-        
-        # Проверка черного списка
+        # Проверка черного списка (проверяем ВСЕ поля)
         blacklist = filters.get("blacklist", [])
         if blacklist:
+            # Собираем все текстовые поля объявления в одну строку для проверки
+            text_to_check = f"{offer.merchant_name} {offer.description} {offer.user_id} {offer.user_mask_id} {' '.join(offer.payment_methods)}".lower()
+            
             for word in blacklist:
-                if word.lower() in offer_text:
+                if word.lower() in text_to_check:
                     return False, f"Найдено запрещенное слово '{word}' в объявлении мерчанта {offer.merchant_name}"
-        
-        # Проверка белого списка (теперь проверяем ВСЕ поля, а не только описание)
-        whitelist = filters.get("whitelist", [])
-        if whitelist:
-            found = any(word.lower() in offer_text for word in whitelist)
-            if not found:
-                return False, f"Нет обязательных слов из: {', '.join(whitelist)}"
         
         # Проверка суммы
         if filters.get("exact_amount"):
@@ -345,7 +335,6 @@ class P2PArbitrageBot:
             if offer.min_amount > filters["max_amount"]:
                 return False, f"Мин. сумма {offer.min_amount:.0f}₽ > {filters['max_amount']:.0f}₽"
         
-        # Проверка платежных систем
         if filters.get("payment_methods"):
             offer_methods = [m.lower() for m in offer.payment_methods]
             required = [m.lower() for m in filters["payment_methods"]]
@@ -629,8 +618,6 @@ class P2PArbitrageBot:
             settings.append(f"• Мин. спред: {filters['min_spread']}%")
         if filters.get("blacklist"):
             settings.append(f"• Черный список (ник/слова): {', '.join(filters['blacklist'])}")
-        if filters.get("whitelist"):
-            settings.append(f"• Белый список: {', '.join(filters['whitelist'])}")
         if filters.get("payment_methods"):
             settings.append(f"• Платежные системы: {', '.join(filters['payment_methods'])}")
         
@@ -711,10 +698,9 @@ async def cmd_help(message: Message):
    /add_blacklist "Имя Мерчанта" - НЕ показывать объявления этого мерчанта (имя в кавычках)
    /remove_blacklist СБП - убрать из черного списка
 
-3. <b>Белый список (только эти)</b>
-   /add_whitelist Т-Банк - ПОКАЗЫВАТЬ только объявления со словом "Т-Банк"
-   /add_whitelist "Т-Банк Онлайн" - с кавычками для фразы из нескольких слов
-   /remove_whitelist Т-Банк - убрать из белого списка
+3. <b>Платежные системы</b>
+   /add_payment Т-Банк - показывать только объявления с этой платежной системой
+   /remove_payment Т-Банк - убрать фильтр по платежной системе
 
 4. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
@@ -735,22 +721,18 @@ async def cmd_help(message: Message):
 3. /set_spread 0.5
 4. /add_blacklist СБП
 5. /add_blacklist "Мошенник Иван"
-6. /add_whitelist Т-Банк
+6. /add_payment Т-Банк
 7. /start_monitoring
 
-<b>Как работают списки:</b>
-• <b>Черный список</b> - запрещает показывать объявления с этими словами
-  Проверяются: ник мерчанта, описание, ID пользователя, платежные системы
-  Пример: если добавить "СБП" - бот пропустит все объявления где есть "СБП"
-  Пример: если добавить "Мошенник" - бот пропустит всех мерчантов с ником "Мошенник"
+<b>Как работает черный список:</b>
+Черный список запрещает показывать объявления с указанными словами.
+Проверяются: ник мерчанта, описание, ID пользователя.
+Пример: если добавить "СБП" - бот пропустит все объявления где есть "СБП"
+Пример: если добавить "Мошенник" - бот пропустит всех мерчантов с ником "Мошенник"
 
-• <b>Белый список</b> - разрешает показывать ТОЛЬКО объявления с этими словами
-  Проверяются: ник мерчанта, описание, ID пользователя, платежные системы
-  Пример: если добавить "Т-Банк" - бот покажет только объявления с "Т-Банк" в любом поле
-  Пример: если добавить "Т-Банк" - будут показаны объявления где в платежных системах указан Т-Банк
-  
-<b>Важно!</b> Если белый список пуст - бот показывает всё, кроме черного списка.
-Если белый список не пуст - бот показывает ТОЛЬКО то, что есть в белом списке.
+<b>Как работают платежные системы:</b>
+Если вы добавили платежные системы, бот будет показывать только объявления с ними.
+Если список платежных систем пуст - бот показывает все объявления.
     """
     await safe_send_message(message, help_text)
 
@@ -958,7 +940,7 @@ async def cmd_add_blacklist(message: Message):
             message, 
             f"✅ Добавлено в ЧЕРНЫЙ список: {word}\n"
             f"Теперь бот НЕ будет показывать объявления с этим словом\n"
-            f"(проверяются: ник мерчанта, описание, ID пользователя, платежные системы)"
+            f"(проверяются: ник мерчанта, описание, ID пользователя)"
         )
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' уже в черном списке")
@@ -983,60 +965,6 @@ async def cmd_remove_blacklist(message: Message):
             del user_filters[user_id]["blacklist"]
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' не найдено в черном списке")
-
-@dp.message(Command("add_whitelist"))
-async def cmd_add_whitelist(message: Message):
-    args = parse_args_with_quotes(message.text)
-    if len(args) != 2:
-        await safe_send_message(
-            message,
-            "❌ Использование: /add_whitelist <слово>\n"
-            "Пример: /add_whitelist Т-Банк\n"
-            "Пример с кавычками: /add_whitelist \"Т-Банк Онлайн\"\n\n"
-            "Теперь бот будет ПОКАЗЫВАТЬ только объявления с этим словом или фразой\n"
-            "Проверяются все поля: ник мерчанта, описание, платежные системы, ID пользователя"
-        )
-        return
-    
-    word = args[1]
-    user_id = message.from_user.id
-    if user_id not in user_filters:
-        user_filters[user_id] = {}
-    
-    if "whitelist" not in user_filters[user_id]:
-        user_filters[user_id]["whitelist"] = []
-    
-    if word not in user_filters[user_id]["whitelist"]:
-        user_filters[user_id]["whitelist"].append(word)
-        await safe_send_message(
-            message,
-            f"✅ Добавлено в БЕЛЫЙ список: {word}\n"
-            f"Теперь бот будет ПОКАЗЫВАТЬ только объявления с этим словом\n"
-            f"(проверяются: ник мерчанта, описание, платежные системы, ID пользователя)"
-        )
-    else:
-        await safe_send_message(message, f"⚠️ Слово '{word}' уже в белом списке")
-
-@dp.message(Command("remove_whitelist"))
-async def cmd_remove_whitelist(message: Message):
-    args = parse_args_with_quotes(message.text)
-    if len(args) != 2:
-        await safe_send_message(message, "❌ Использование: /remove_whitelist <слово>\nПример: /remove_whitelist Т-Банк")
-        return
-    
-    word = args[1]
-    user_id = message.from_user.id
-    if user_id not in user_filters or "whitelist" not in user_filters[user_id]:
-        await safe_send_message(message, "⚠️ Белый список пуст")
-        return
-    
-    if word in user_filters[user_id]["whitelist"]:
-        user_filters[user_id]["whitelist"].remove(word)
-        await safe_send_message(message, f"✅ Удалено из белого списка: {word}")
-        if not user_filters[user_id]["whitelist"]:
-            del user_filters[user_id]["whitelist"]
-    else:
-        await safe_send_message(message, f"⚠️ Слово '{word}' не найдено в белом списке")
 
 @dp.message(Command("add_payment"))
 async def cmd_add_payment(message: Message):
