@@ -653,7 +653,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="start_monitoring", description="▶️ Запустить мониторинг арбитража"),
         BotCommand(command="stop_monitoring", description="⏹ Остановить мониторинг"),
         BotCommand(command="clear_filters", description="🧹 Очистить все фильтры"),
-        BotCommand(command="help", description="❓ Помощь по настройке фильтров"),
+        BotCommand(command="help", description="❓ Настройка фильтров"),
     ]
     await bot.set_my_commands(commands)
     logger.info("✅ Меню команд установлено")
@@ -675,15 +675,15 @@ async def cmd_start(message: Message):
 Я ищу арбитражные связки на Bybit P2P и присылаю тебе сигналы.
 
 <b>Доступные команды:</b>
-/settings - Настройка фильтров
+/help - Настройка фильтров
+/settings - Текущие настройки фильтров
 /status - Статус мониторинга
 /start_monitoring - Запустить мониторинг
 /stop_monitoring - Остановить мониторинг
 /clear_filters - Очистить все фильтры
-/help - Помощь
 
 <b>Как это работает:</b>
-1. Настрой фильтры через /settings
+1. Настрой фильтры через /help
 2. Запусти мониторинг /start_monitoring
 3. Бот будет искать выгодные связки
 4. При найденной связке получишь сигнал со ссылками на профили
@@ -785,7 +785,7 @@ async def cmd_start_monitoring(message: Message):
         await safe_send_message(
             message,
             "⚠️ Сначала настройте фильтры!\n"
-            "Используйте /settings для просмотра и /help для инструкций."
+            "Используйте /help для настройки и /settings для просмотра."
         )
         return
     
@@ -1005,3 +1005,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
