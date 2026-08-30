@@ -4,4 +4,4 @@ python-dotenv==1.0.1
 pybit
 telegram
 python-telegram-bot==20.7
-google-generativeai
+google-genai

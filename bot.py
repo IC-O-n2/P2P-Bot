@@ -20,8 +20,9 @@ from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
-# Импорт для Gemini
-import google.generativeai as genai
+# Импорт нового SDK Google GenAI
+from google import genai
+from google.genai import types
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -45,14 +46,17 @@ if not TELEGRAM_TOKEN:
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     logger.warning("⚠️ API ключи Bybit не найдены! Бот будет работать в ограниченном режиме.")
 
+# Инициализация нового клиента Gemini
+gemini_client = None
 if not GEMINI_API_KEY:
     logger.warning("⚠️ API ключ Gemini не найден! Анализ remark будет отключен.")
 else:
-    # Инициализация Gemini
-    genai.configure(api_key=GEMINI_API_KEY)
-    # Используем бесплатную модель
-    gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
-    logger.info("✅ Gemini инициализирован")
+    try:
+        # Используем новый способ инициализации
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        logger.info("✅ Gemini клиент (новый SDK) инициализирован")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации Gemini: {e}")
 
 # Хранилище для фильтров пользователей
 user_filters: Dict[int, Dict] = {}
@@ -142,15 +146,15 @@ async def safe_send_message(message: Message, text: str):
         logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
         await message.answer(text.replace('<', '[').replace('>', ']'))
 
-# Функция для анализа remark с помощью Gemini
+# Функция для анализа remark с помощью Gemini (новый SDK)
 async def analyze_remark_with_gemini(remark: str, merchant_name: str) -> Dict[str, any]:
     """
     Анализирует remark объявления с помощью Gemini для определения:
     1. Готов ли мерчант принимать платежи от 3-их лиц
     2. Дополнительная информация о платежах
     """
-    if not GEMINI_API_KEY or not remark or remark.strip() == "":
-        # Если нет API ключа или remark пустой - возвращаем стандартный ответ
+    if not gemini_client or not remark or remark.strip() == "":
+        # Если нет клиента или remark пустой - возвращаем стандартный ответ
         return {
             "third_party_ready": True,  # По умолчанию считаем, что готов
             "confidence": 0.5,
@@ -184,13 +188,22 @@ async def analyze_remark_with_gemini(remark: str, merchant_name: str) -> Dict[st
 Важно: Если в тексте нет упоминаний о третьих лицах, возвращай third_party_ready = True.
 """
         
-        # Делаем запрос к Gemini
+        # Используем новый синтаксис для генерации контента
         response = await asyncio.get_event_loop().run_in_executor(
-            None, 
-            lambda: gemini_model.generate_content(prompt)
+            None,
+            lambda: gemini_client.models.generate_content(
+                model='gemini-2.0-flash-exp',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    top_p=0.95,
+                    top_k=40,
+                    max_output_tokens=1024,
+                )
+            )
         )
         
-        # Парсим ответ
+        # Получаем текст ответа
         result_text = response.text.strip()
         
         # Пытаемся извлечь JSON из ответа
@@ -482,7 +495,7 @@ class P2PArbitrageBot:
     
     async def _analyze_offers_with_gemini(self, sellers: List[P2POffer], buyers: List[P2POffer]) -> Tuple[List[P2POffer], List[P2POffer]]:
         """Анализирует все объявления через Gemini для определения third_party_ready"""
-        if not GEMINI_API_KEY:
+        if not gemini_client:
             logger.warning("⚠️ Gemini не инициализирован, пропускаем анализ")
             return sellers, buyers
         
