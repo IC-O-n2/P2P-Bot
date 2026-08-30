@@ -12,6 +12,7 @@ from decimal import Decimal
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 import re
+from collections import deque
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Message, BotCommand
@@ -52,14 +53,10 @@ if not GEMINI_API_KEY:
     logger.warning("⚠️ API ключ Gemini не найден! Анализ remark будет отключен.")
 else:
     try:
-        # Используем новый способ инициализации
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         logger.info("✅ Gemini клиент (новый SDK) инициализирован")
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации Gemini: {e}")
-
-# Кэш для результатов анализа Gemini (чтобы не анализировать повторно)
-gemini_cache: Dict[str, Dict[str, any]] = {}
 
 # Хранилище для фильтров пользователей
 user_filters: Dict[int, Dict] = {}
@@ -72,9 +69,14 @@ sent_signals: Dict[int, Dict[str, datetime]] = {}
 user_signal_delay: Dict[int, int] = {}
 
 # Хранилище для режимов анализа third_party
-# True - фильтровать только объявления с явным указанием готовности к платежам от 3-их лиц
-# False - показывать все объявления (режим по умолчанию)
 user_third_party_mode: Dict[int, bool] = {}
+
+# Очередь проверенных объявлений для каждого пользователя
+# Храним кортежи (P2POffer, side) где side = 'seller' или 'buyer'
+user_verified_offers_queue: Dict[int, deque] = {}
+
+# Флаг, указывающий, что идет процесс анализа для пользователя
+user_analysis_in_progress: Dict[int, bool] = {}
 
 # Вспомогательная функция для парсинга аргументов с поддержкой кавычек
 def parse_args_with_quotes(text: str) -> List[str]:
@@ -91,21 +93,17 @@ def parse_args_with_quotes(text: str) -> List[str]:
     while i < len(text):
         char = text[i]
         
-        # Проверяем начало или конец кавычек
         if char in ('"', "'") and (i == 0 or text[i-1] != '\\'):
             if not in_quotes:
-                # Начало кавычек
                 in_quotes = True
                 quote_char = char
             elif quote_char == char:
-                # Конец кавычек
                 in_quotes = False
                 quote_char = None
             i += 1
             continue
         
         if not in_quotes and char == ' ':
-            # Пробел вне кавычек - разделитель аргументов
             if current_arg:
                 args.append(current_arg)
                 current_arg = ""
@@ -115,32 +113,20 @@ def parse_args_with_quotes(text: str) -> List[str]:
         current_arg += char
         i += 1
     
-    # Добавляем последний аргумент
     if current_arg:
         args.append(current_arg)
     
     return args
 
-# Функция для проверки наличия слова в тексте с учетом границ слов
 def check_word_in_text(word: str, text: str) -> bool:
-    """
-    Проверяет наличие слова в тексте с учетом границ слов.
-    Использует регулярные выражения для точного поиска.
-    """
-    # Экранируем специальные символы в слове
+    """Проверяет наличие слова в тексте с учетом границ слов."""
     escaped_word = re.escape(word)
-    # Создаем паттерн для поиска слова как отдельного слова или части слова
-    # Используем границы слов \b, но также проверяем наличие слова в составе других слов
-    # если слово короткое (до 3 символов), ищем как отдельное слово
     if len(word) <= 3:
         pattern = rf'\b{escaped_word}\b'
     else:
-        # Для длинных слов ищем как часть слова или отдельное слово
         pattern = rf'{escaped_word}'
-    
     return bool(re.search(pattern, text, re.IGNORECASE))
 
-# Функция для безопасной отправки сообщений
 async def safe_send_message(message: Message, text: str):
     """Отправка сообщения с безопасной обработкой HTML"""
     try:
@@ -149,98 +135,103 @@ async def safe_send_message(message: Message, text: str):
         logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
         await message.answer(text.replace('<', '[').replace('>', ']'))
 
-# Функция для анализа remark с помощью Gemini (с кэшированием)
-async def analyze_remark_with_gemini(remark: str, merchant_name: str, item_id: str) -> Dict[str, any]:
+# Функция для массового анализа remark через Gemini (ОДИН ЗАПРОС)
+async def analyze_remarks_batch(offers: List[Tuple[P2POffer, str]]) -> Dict[str, Dict[str, any]]:
     """
-    Анализирует remark объявления с помощью Gemini для определения:
-    1. Готов ли мерчант принимать платежи от 3-их лиц
-    2. Дополнительная информация о платежах
-    
-    Использует кэш для повторных анализов.
+    Анализирует remark нескольких объявлений в одном запросе к Gemini.
+    offers: список кортежей (P2POffer, side)
+    Возвращает словарь с результатами по item_id
     """
-    # Создаем ключ кэша
-    cache_key = f"{item_id}_{merchant_name}_{remark[:50]}"
+    if not gemini_client or not offers:
+        return {}
     
-    # Проверяем кэш
-    if cache_key in gemini_cache:
-        logger.info(f"♻️ Использован кэш для {merchant_name}")
-        return gemini_cache[cache_key]
+    # Формируем промпт для всех объявлений
+    prompt_parts = []
+    for idx, (offer, side) in enumerate(offers):
+        if not offer.remark or not offer.remark.strip():
+            continue
+        prompt_parts.append(f"""
+Объявление #{idx + 1}:
+- Мерчант: {offer.merchant_name}
+- Сторона: {side}
+- Текст (remark): "{offer.remark}"
+""")
     
-    if not gemini_client or not remark or remark.strip() == "":
-        # Если нет клиента или remark пустой - возвращаем стандартный ответ
-        result = {
-            "third_party_ready": True,  # По умолчанию считаем, что готов
-            "confidence": 0.5,
-            "analysis": "Нет данных для анализа",
-            "raw_remark": remark
-        }
-        gemini_cache[cache_key] = result
-        return result
+    if not prompt_parts:
+        return {}
+    
+    full_prompt = f"""
+Проанализируй следующие объявления и определи для каждого, готов ли мерчант принимать платежи от ТРЕТЬИХ ЛИЦ (third-party payments).
+
+Третьи лица - это когда платеж за USDT совершает не сам покупатель, а другое лицо (друг, родственник, коллега и т.д.).
+
+Правила анализа:
+1. Если есть явный запрет: "только от себя", "только свои карты", "не принимаю от третьих лиц", "только свое имя" -> НЕ ГОТОВ (False)
+2. Если есть явное разрешение: "принимаю от третьих лиц", "можно от друзей", "от родственников" -> ГОТОВ (True)
+3. Если нет упоминаний о третьих лицах -> ГОТОВ (True) (по умолчанию)
+
+Верни ответ строго в формате JSON:
+{{
+    "results": [
+        {{
+            "index": 1,
+            "third_party_ready": true/false,
+            "analysis": "краткий вывод (1-2 предложения на русском)"
+        }},
+        ...
+    ]
+}}
+
+Объявления для анализа:
+{''.join(prompt_parts)}
+"""
     
     try:
-        # Промпт для Gemini (упрощенный для скорости)
-        prompt = f"""
-Анализ текста от {merchant_name}: "{remark}"
-
-Готов ли мерчант принимать платежи от ТРЕТЬИХ ЛИЦ (third-party)?
-Третьи лица - платеж совершает не покупатель, а другое лицо.
-
-Правила:
-- Если есть фразы "только от себя", "только свои карты", "не принимаю от третьих лиц" -> НЕ готов (False)
-- Если есть "принимаю от третьих лиц", "можно от друзей/родственников" -> ГОТОВ (True)
-- Если нет упоминаний о третьих лицах -> ГОТОВ (True) (по умолчанию)
-
-Верни JSON: {{"third_party_ready": true/false, "confidence": 0-1, "analysis": "краткий вывод"}}
-"""
+        logger.info(f"🧠 Отправка одного запроса в Gemini для {len(offers)} объявлений")
         
-        # Используем быструю модель с минимальными настройками
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: gemini_client.models.generate_content(
-                model='gemini-3.6-flash',  # Самая быстрая модель
-                contents=prompt,
+                model='gemini-3.6-flash',  # Используем указанную модель
+                contents=full_prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.0,  # Минимальная креативность для скорости
+                    temperature=0.0,
                     top_p=0.8,
-                    max_output_tokens=200,  # Ограничиваем вывод
+                    max_output_tokens=800,  # Достаточно для нескольких объявлений
                 )
             )
         )
         
-        # Получаем текст ответа
         result_text = response.text.strip()
+        logger.info(f"📥 Получен ответ от Gemini: {result_text[:200]}...")
         
-        # Пытаемся извлечь JSON из ответа
+        # Парсим JSON ответ
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if json_match:
-            result = json.loads(json_match.group())
-            # Добавляем сырой remark
-            result["raw_remark"] = remark
-            # Сохраняем в кэш
-            gemini_cache[cache_key] = result
-            logger.info(f"✅ Gemini анализ для {merchant_name}: third_party={result.get('third_party_ready')}")
-            return result
+            data = json.loads(json_match.group())
+            results = data.get("results", [])
+            
+            # Сопоставляем результаты с объявлениями
+            result_dict = {}
+            for res in results:
+                idx = res.get("index") - 1
+                if 0 <= idx < len(offers):
+                    offer, side = offers[idx]
+                    result_dict[offer.item_id] = {
+                        "third_party_ready": res.get("third_party_ready", True),
+                        "analysis": res.get("analysis", ""),
+                        "side": side
+                    }
+            
+            logger.info(f"✅ Успешно проанализировано {len(result_dict)} объявлений")
+            return result_dict
         else:
-            logger.warning(f"⚠️ Не удалось распарсить ответ Gemini для {merchant_name}")
-            result = {
-                "third_party_ready": True,
-                "confidence": 0.5,
-                "analysis": "Не удалось проанализировать",
-                "raw_remark": remark
-            }
-            gemini_cache[cache_key] = result
-            return result
+            logger.warning(f"⚠️ Не удалось распарсить ответ Gemini")
+            return {}
             
     except Exception as e:
-        logger.error(f"❌ Ошибка при анализе Gemini для {merchant_name}: {e}")
-        result = {
-            "third_party_ready": True,  # В случае ошибки пропускаем объявление
-            "confidence": 0.5,
-            "analysis": f"Ошибка: {str(e)[:50]}",
-            "raw_remark": remark
-        }
-        gemini_cache[cache_key] = result
-        return result
+        logger.error(f"❌ Ошибка при массовом анализе Gemini: {e}")
+        return {}
 
 @dataclass
 class P2POffer:
@@ -258,7 +249,6 @@ class P2POffer:
     user_id: str
     user_mask_id: str
     remark: str = ""
-    # Поля для результатов анализа Gemini
     third_party_ready: bool = True
     third_party_analysis: str = ""
     token: str = "USDT"
@@ -371,8 +361,6 @@ class BybitP2PClient:
                 item_id = str(item.get("itemId", ""))
                 user_id = str(item.get("uid", ""))
                 user_mask_id = str(item.get("userMaskId", ""))
-                
-                # Получаем remark из объявления
                 remark = item.get("remark", "")
                 
                 offer = P2POffer(
@@ -389,7 +377,7 @@ class BybitP2PClient:
                     user_id=user_id,
                     user_mask_id=user_mask_id,
                     remark=remark,
-                    third_party_ready=True,  # По умолчанию
+                    third_party_ready=True,
                     third_party_analysis=""
                 )
                 offers.append(offer)
@@ -408,24 +396,21 @@ class P2PArbitrageBot:
         self.is_running = False
         self.monitor_task: Optional[asyncio.Task] = None
         self.bybit_client = None
-        self._stop_requested = False  # Флаг для экстренной остановки
-        self.semaphore = asyncio.Semaphore(5)  # Ограничиваем количество параллельных запросов к Gemini
+        self._stop_requested = False
         
         if BYBIT_API_KEY and BYBIT_API_SECRET:
             self.bybit_client = BybitP2PClient(BYBIT_API_KEY, BYBIT_API_SECRET)
             logger.info("✅ Bybit клиент инициализирован")
         else:
             logger.warning("⚠️ Bybit клиент не инициализирован (нет API ключей)")
-        
+    
     async def start(self):
-        """Запуск бота"""
         self.is_running = True
         self._stop_requested = False
         self.monitor_task = asyncio.create_task(self._monitor_loop())
         logger.info("Бот успешно запущен")
-        
+    
     async def stop(self):
-        """Остановка бота"""
         self.is_running = False
         self._stop_requested = True
         if self.monitor_task:
@@ -436,208 +421,207 @@ class P2PArbitrageBot:
                 pass
         logger.info("Бот остановлен")
     
-    async def stop_for_user(self, user_id: int):
-        """Остановка мониторинга для конкретного пользователя"""
-        user_subscriptions[user_id] = False
-        # Очищаем кэш отправленных сигналов для пользователя
-        if user_id in sent_signals:
-            sent_signals[user_id].clear()
-        logger.info(f"Мониторинг остановлен для пользователя {user_id}")
-    
     def _fetch_p2p_offers_sync(self, side: str) -> List[P2POffer]:
         """Получение P2P-объявлений с Bybit"""
         if not self.bybit_client:
-            logger.warning("Bybit клиент не доступен")
             return []
-        
         try:
-            if side.upper() == "BUY":
-                return self.bybit_client.get_online_ads("BUY", page=1, size=50)
-            else:
-                return self.bybit_client.get_online_ads("SELL", page=1, size=50)
+            return self.bybit_client.get_online_ads(side, page=1, size=50)
         except Exception as e:
             logger.error(f"Ошибка при получении объявлений: {e}")
             return []
     
     def _check_offer_conditions(self, offer: P2POffer, filters: Dict) -> Tuple[bool, str]:
-        """Проверка условий мейкера для объявления"""
+        """Проверка условий для объявления"""
         if not filters:
             return True, "OK"
         
-        # Проверка черного списка (только по нику мерчанта)
         blacklist = filters.get("blacklist", [])
         if blacklist:
-            # Проверяем только имя мерчанта
             merchant_name_lower = offer.merchant_name.lower()
-            
-            # Логируем для отладки
-            logger.debug(f"Проверка черного списка для мерчанта {offer.merchant_name}: {blacklist}")
-            
             for word in blacklist:
-                # Используем улучшенную проверку с регулярными выражениями
                 if check_word_in_text(word, merchant_name_lower):
-                    logger.info(f"Найдено запрещенное слово '{word}' в нике мерчанта {offer.merchant_name}")
-                    return False, f"Найдено запрещенное слово '{word}' в нике мерчанта {offer.merchant_name}"
+                    return False, f"Найдено запрещенное слово '{word}' в нике мерчанта"
         
-        # Проверка суммы
         if filters.get("exact_amount"):
             if not (offer.min_amount <= filters["exact_amount"] <= offer.max_amount):
-                return False, f"Сумма {filters['exact_amount']:.0f}₽ не входит в лимиты {offer.min_amount:.0f}-{offer.max_amount:.0f}₽"
+                return False, f"Сумма не входит в лимиты"
         
         if filters.get("min_amount"):
             if offer.max_amount < filters["min_amount"]:
-                return False, f"Макс. сумма {offer.max_amount:.0f}₽ < {filters['min_amount']:.0f}₽"
+                return False, f"Макс. сумма < {filters['min_amount']:.0f}₽"
         
         if filters.get("max_amount"):
             if offer.min_amount > filters["max_amount"]:
-                return False, f"Мин. сумма {offer.min_amount:.0f}₽ > {filters['max_amount']:.0f}₽"
+                return False, f"Мин. сумма > {filters['max_amount']:.0f}₽"
         
         return True, "OK"
     
     def _generate_profile_url(self, user_mask_id: str) -> str:
-        """Генерирует ссылку на профиль пользователя Bybit используя userMaskId"""
         if not user_mask_id or user_mask_id == "0" or user_mask_id == "":
             return "Ссылка недоступна"
         return f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item"
     
-    def _generate_order_url(self, item_id: str) -> str:
-        """Генерирует ссылку на ордер Bybit"""
-        if not item_id or item_id == "0" or item_id == "":
-            return "Ссылка недоступна"
-        return f"https://www.bybit.com/ru-RU/p2p/order/{item_id}"
-    
-    async def _analyze_single_offer(self, offer: P2POffer) -> P2POffer:
-        """Анализирует одно объявление через Gemini с семафором"""
-        async with self.semaphore:
-            if offer.remark and offer.remark.strip():
-                analysis = await analyze_remark_with_gemini(offer.remark, offer.merchant_name, offer.item_id)
-                offer.third_party_ready = analysis.get("third_party_ready", True)
-                offer.third_party_analysis = analysis.get("analysis", "")
-            return offer
-    
-    async def _analyze_offers_with_gemini(self, sellers: List[P2POffer], buyers: List[P2POffer]) -> Tuple[List[P2POffer], List[P2POffer]]:
-        """Анализирует все объявления через Gemini параллельно"""
-        if not gemini_client:
-            logger.warning("⚠️ Gemini не инициализирован, пропускаем анализ")
-            return sellers, buyers
-        
-        # Сортируем по наличию remark (сначала те, у кого есть remark)
-        sellers_sorted = sorted(sellers, key=lambda x: bool(x.remark and x.remark.strip()), reverse=True)
-        buyers_sorted = sorted(buyers, key=lambda x: bool(x.remark and x.remark.strip()), reverse=True)
-        
-        # Ограничиваем количество анализируемых объявлений (только топ-15)
-        max_analyze = 15
-        sellers_to_analyze = sellers_sorted[:max_analyze]
-        buyers_to_analyze = buyers_sorted[:max_analyze]
-        
-        logger.info(f"🧠 Запуск параллельного анализа Gemini для {len(sellers_to_analyze)} продавцов и {len(buyers_to_analyze)} покупателей")
-        
-        # Создаем задачи для параллельного анализа
-        seller_tasks = [self._analyze_single_offer(seller) for seller in sellers_to_analyze]
-        buyer_tasks = [self._analyze_single_offer(buyer) for buyer in buyers_to_analyze]
-        
-        # Запускаем все задачи параллельно
-        analyzed_sellers = await asyncio.gather(*seller_tasks)
-        analyzed_buyers = await asyncio.gather(*buyer_tasks)
-        
-        # Добавляем остальные объявления без анализа
-        remaining_sellers = sellers_sorted[max_analyze:]
-        remaining_buyers = buyers_sorted[max_analyze:]
-        
-        all_sellers = analyzed_sellers + remaining_sellers
-        all_buyers = analyzed_buyers + remaining_buyers
-        
-        logger.info(f"✅ Анализ Gemini завершен")
-        return all_sellers, all_buyers
-    
-    def _filter_by_third_party(self, sellers: List[P2POffer], buyers: List[P2POffer], 
-                               third_party_mode: bool) -> Tuple[List[P2POffer], List[P2POffer]]:
+    async def _refill_verified_offers_queue(self, user_id: int):
         """
-        Фильтрует объявления по готовности принимать платежи от 3-их лиц
-        third_party_mode=True - показываем только объявления с third_party_ready=True
-        third_party_mode=False - показываем все объявления
+        Пополняет очередь проверенных объявлений для пользователя.
+        Делает один запрос к Gemini для 5 продавцов и 5 покупателей.
         """
-        if not third_party_mode:
-            logger.info("ℹ️ Режим third_party отключен - показываем все объявления")
-            return sellers, buyers
+        # Проверяем, не идет ли уже анализ
+        if user_analysis_in_progress.get(user_id, False):
+            logger.info(f"⏳ Анализ уже идет для пользователя {user_id}, пропускаем")
+            return
         
-        logger.info(f"🔍 Фильтрация по third_party (только готовые к платежам от 3-их лиц)")
+        # Проверяем, нужно ли пополнять очередь
+        queue = user_verified_offers_queue.get(user_id, deque())
+        if len(queue) >= 10:  # Если в очереди достаточно объявлений
+            return
         
-        filtered_sellers = [s for s in sellers if s.third_party_ready]
-        filtered_buyers = [b for b in buyers if b.third_party_ready]
+        user_analysis_in_progress[user_id] = True
         
-        logger.info(f"📊 Отфильтровано: продавцов {len(sellers)}->{len(filtered_sellers)}, покупателей {len(buyers)}->{len(filtered_buyers)}")
-        
-        return filtered_sellers, filtered_buyers
+        try:
+            logger.info(f"🔄 Пополнение очереди для пользователя {user_id}")
+            
+            # Получаем свежие объявления
+            sellers = await asyncio.get_event_loop().run_in_executor(
+                None, self._fetch_p2p_offers_sync, "SELL"
+            )
+            buyers = await asyncio.get_event_loop().run_in_executor(
+                None, self._fetch_p2p_offers_sync, "BUY"
+            )
+            
+            if not sellers or not buyers:
+                logger.warning(f"⚠️ Нет объявлений для пользователя {user_id}")
+                return
+            
+            # Фильтруем по основным условиям
+            filters = user_filters.get(user_id, {})
+            
+            filtered_sellers = []
+            for seller in sellers:
+                passes, _ = self._check_offer_conditions(seller, filters)
+                if passes:
+                    filtered_sellers.append(seller)
+            
+            filtered_buyers = []
+            for buyer in buyers:
+                passes, _ = self._check_offer_conditions(buyer, filters)
+                if passes:
+                    filtered_buyers.append(buyer)
+            
+            if not filtered_sellers or not filtered_buyers:
+                logger.info(f"ℹ️ Нет подходящих объявлений для пользователя {user_id}")
+                return
+            
+            # Сортируем для выбора лучших
+            filtered_sellers.sort(key=lambda x: x.price)
+            filtered_buyers.sort(key=lambda x: x.price, reverse=True)
+            
+            # Берем топ-5 продавцов и топ-5 покупателей
+            top_sellers = filtered_sellers[:5]
+            top_buyers = filtered_buyers[:5]
+            
+            # Проверяем, есть ли remark для анализа
+            offers_to_analyze = []
+            for seller in top_sellers:
+                if seller.remark and seller.remark.strip():
+                    offers_to_analyze.append((seller, "SELL"))
+            for buyer in top_buyers:
+                if buyer.remark and buyer.remark.strip():
+                    offers_to_analyze.append((buyer, "BUY"))
+            
+            # Если есть что анализировать - отправляем один запрос в Gemini
+            if offers_to_analyze:
+                analysis_results = await analyze_remarks_batch(offers_to_analyze)
+                
+                # Применяем результаты анализа к объявлениям
+                for offer, side in offers_to_analyze:
+                    if offer.item_id in analysis_results:
+                        result = analysis_results[offer.item_id]
+                        offer.third_party_ready = result.get("third_party_ready", True)
+                        offer.third_party_analysis = result.get("analysis", "")
+                
+                # Добавляем проанализированные объявления в очередь
+                queue = user_verified_offers_queue.get(user_id, deque())
+                
+                # Добавляем продавцов
+                for seller in top_sellers:
+                    # Проверяем third_party режим
+                    third_party_mode = user_third_party_mode.get(user_id, False)
+                    if third_party_mode and not seller.third_party_ready:
+                        continue
+                    queue.append(("seller", seller))
+                
+                # Добавляем покупателей
+                for buyer in top_buyers:
+                    third_party_mode = user_third_party_mode.get(user_id, False)
+                    if third_party_mode and not buyer.third_party_ready:
+                        continue
+                    queue.append(("buyer", buyer))
+                
+                user_verified_offers_queue[user_id] = queue
+                logger.info(f"✅ Очередь пополнена: {len(queue)} объявлений для пользователя {user_id}")
+            else:
+                logger.info(f"ℹ️ Нет remark для анализа у пользователя {user_id}")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка при пополнении очереди: {e}")
+        finally:
+            user_analysis_in_progress[user_id] = False
     
-    def _find_arbitrage_signals_fast(self, sellers: List[P2POffer], buyers: List[P2POffer],
-                                      user_filters: Dict, max_results: int = 10) -> List[ArbitrageSignal]:
+    def _find_signals_from_queues(self, user_id: int, max_signals: int = 5) -> List[ArbitrageSignal]:
         """
-        Быстрый поиск арбитражных связок (оптимизированная версия)
+        Находит сигналы из имеющихся в очереди объявлений.
         """
+        queue = user_verified_offers_queue.get(user_id, deque())
+        if len(queue) < 2:  # Нужны и продавец, и покупатель
+            return []
+        
+        # Извлекаем всех продавцов и покупателей из очереди
+        sellers = []
+        buyers = []
+        
+        for item_type, offer in queue:
+            if item_type == "seller":
+                sellers.append(offer)
+            else:
+                buyers.append(offer)
+        
         if not sellers or not buyers:
             return []
         
-        # Быстрая фильтрация по условиям
-        filtered_sellers = []
-        for seller in sellers:
-            passes, _ = self._check_offer_conditions(seller, user_filters)
-            if passes:
-                filtered_sellers.append(seller)
-        
-        filtered_buyers = []
-        for buyer in buyers:
-            passes, _ = self._check_offer_conditions(buyer, user_filters)
-            if passes:
-                filtered_buyers.append(buyer)
-        
-        if not filtered_sellers or not filtered_buyers:
-            return []
-        
-        # Сортируем продавцов по возрастанию цены (самые дешевые сверху)
-        filtered_sellers.sort(key=lambda x: x.price)
-        # Сортируем покупателей по убыванию цены (самые дорогие сверху)
-        filtered_buyers.sort(key=lambda x: x.price, reverse=True)
-        
+        filters = user_filters.get(user_id, {})
+        min_spread = filters.get("min_spread", 0.5)
         signals = []
-        min_spread = user_filters.get("min_spread", 0.5)
         
-        # Берем только топ-10 продавцов и покупателей для скорости
-        top_sellers = filtered_sellers[:10]
-        top_buyers = filtered_buyers[:10]
-        
-        for seller in top_sellers:
-            for buyer in top_buyers:
+        # Ищем связки
+        for seller in sellers[:10]:
+            for buyer in buyers[:10]:
                 if seller.price >= buyer.price:
                     continue
                 
                 spread = ((buyer.price / seller.price) - 1) * 100
-                
                 if spread < min_spread:
                     continue
                 
-                # Проверяем пересечение лимитов
                 max_trade_amount = min(seller.max_amount, buyer.max_amount)
                 min_trade_amount = max(seller.min_amount, buyer.min_amount)
                 
                 if max_trade_amount < min_trade_amount:
                     continue
                 
-                if user_filters.get("min_amount"):
-                    if max_trade_amount < user_filters["min_amount"]:
-                        continue
+                if filters.get("min_amount") and max_trade_amount < filters["min_amount"]:
+                    continue
                 
-                if user_filters.get("max_amount"):
-                    if min_trade_amount > user_filters["max_amount"]:
-                        continue
+                if filters.get("max_amount") and min_trade_amount > filters["max_amount"]:
+                    continue
                 
-                # Расчет прибыли
                 trade_amount = max_trade_amount
                 usdt_amount = trade_amount / seller.price if seller.price > 0 else 0
                 profit_per_usdt = buyer.price - seller.price
                 total_profit_rub = usdt_amount * profit_per_usdt
                 
-                signal_id = f"{seller.item_id}_{seller.price}_{buyer.item_id}_{buyer.price}"
+                signal_id = f"{seller.item_id}_{buyer.item_id}_{seller.price}_{buyer.price}"
                 
                 signal = ArbitrageSignal(
                     seller=seller,
@@ -650,140 +634,85 @@ class P2PArbitrageBot:
                 )
                 signals.append(signal)
         
-        # Сортируем по прибыли и берем топ
         signals.sort(key=lambda x: x.profit_rub, reverse=True)
-        return signals[:max_results]
-    
-    def _clean_old_signals(self, user_id: int):
-        """Очищает старые сигналы (старше 10 минут)"""
-        if user_id not in sent_signals:
-            sent_signals[user_id] = {}
-            return
-        
-        now = datetime.now()
-        old_signals = []
-        for signal_id, sent_time in sent_signals[user_id].items():
-            if now - sent_time > timedelta(minutes=10):
-                old_signals.append(signal_id)
-        
-        for signal_id in old_signals:
-            del sent_signals[user_id][signal_id]
-        
-        if old_signals:
-            logger.debug(f"Очищено {len(old_signals)} старых сигналов для пользователя {user_id}")
+        return signals[:max_signals]
     
     async def _monitor_loop(self):
         """Основной цикл мониторинга"""
         while self.is_running and not self._stop_requested:
             try:
                 if not self.bybit_client:
-                    logger.warning("Пропуск цикла: Bybit клиент не инициализирован")
                     await asyncio.sleep(30)
                     continue
                 
-                # Получаем список активных пользователей ДО начала цикла
-                active_users = []
-                for user_id, is_active in user_subscriptions.items():
-                    if is_active and not self._stop_requested:
-                        active_users.append(user_id)
+                # Получаем активных пользователей
+                active_users = [
+                    user_id for user_id, is_active in user_subscriptions.items()
+                    if is_active and not self._stop_requested
+                ]
                 
                 if not active_users:
                     await asyncio.sleep(15)
                     continue
                 
                 for user_id in active_users:
-                    # Проверяем флаг остановки перед каждым пользователем
                     if not self.is_running or self._stop_requested:
-                        logger.info(f"Остановка мониторинга по запросу пользователя {user_id}")
                         return
                     
-                    # Проверяем, активен ли пользователь
                     if not user_subscriptions.get(user_id, False):
                         continue
                     
-                    filters = user_filters.get(user_id, {})
-                    if not filters:
-                        continue
+                    # Проверяем и пополняем очередь если нужно
+                    await self._refill_verified_offers_queue(user_id)
                     
-                    self._clean_old_signals(user_id)
-                    
-                    # Получаем объявления
-                    sellers = await asyncio.get_event_loop().run_in_executor(
-                        None, self._fetch_p2p_offers_sync, "SELL"
-                    )
-                    
-                    if not self.is_running or self._stop_requested:
-                        return
-                    
-                    buyers = await asyncio.get_event_loop().run_in_executor(
-                        None, self._fetch_p2p_offers_sync, "BUY"
-                    )
-                    
-                    if not self.is_running or self._stop_requested:
-                        return
-                    
-                    if not sellers or not buyers:
-                        continue
-                    
-                    # Анализируем объявления через Gemini (параллельно)
-                    sellers, buyers = await self._analyze_offers_with_gemini(sellers, buyers)
-                    
-                    # Проверяем режим third_party для пользователя
-                    third_party_mode = user_third_party_mode.get(user_id, False)
-                    
-                    # Фильтруем по third_party если нужно
-                    if third_party_mode:
-                        sellers, buyers = self._filter_by_third_party(sellers, buyers, third_party_mode)
-                    
-                    # Проверяем, что после фильтрации остались объявления
-                    if not sellers or not buyers:
-                        logger.info(f"ℹ️ Нет объявлений после фильтрации third_party для пользователя {user_id}")
-                        continue
-                    
-                    # Быстрый поиск сигналов
-                    signals = self._find_arbitrage_signals_fast(sellers, buyers, filters, max_results=10)
+                    # Находим сигналы из очереди
+                    signals = self._find_signals_from_queues(user_id, max_signals=3)
                     
                     if signals:
-                        logger.info(f"Найдено {len(signals)} сигналов для пользователя {user_id}")
-                        
                         if user_id not in sent_signals:
                             sent_signals[user_id] = {}
                         
-                        # Получаем задержку для пользователя (по умолчанию 4 секунды)
                         delay_seconds = user_signal_delay.get(user_id, 4)
-                        
                         sent_count = 0
-                        skipped_count = 0
                         
                         for signal in signals:
-                            # Проверяем флаг остановки перед отправкой каждого сигнала
                             if not self.is_running or self._stop_requested:
-                                logger.info(f"Остановка мониторинга во время отправки сигналов")
                                 return
                             
-                            # Проверяем, активен ли пользователь
                             if not user_subscriptions.get(user_id, False):
-                                logger.info(f"Пользователь {user_id} отключил мониторинг, пропускаем сигналы")
                                 break
                             
                             if signal.signal_id not in sent_signals[user_id]:
                                 await self._send_signal(user_id, signal)
                                 sent_signals[user_id][signal.signal_id] = datetime.now()
                                 sent_count += 1
-                                logger.info(f"Отправлен сигнал #{sent_count}: SELL={signal.seller.merchant_name} {signal.seller.price:.2f}₽, BUY={signal.buyer.merchant_name} {signal.buyer.price:.2f}₽, прибыль={signal.profit_rub:.2f}₽")
                                 
-                                # Используем задержку между сигналами
+                                # Удаляем использованные объявления из очереди
+                                queue = user_verified_offers_queue.get(user_id, deque())
+                                # Удаляем продавца и покупателя, которые были использованы
+                                to_remove = []
+                                for i, (item_type, offer) in enumerate(queue):
+                                    if (item_type == "seller" and offer.item_id == signal.seller.item_id) or \
+                                       (item_type == "buyer" and offer.item_id == signal.buyer.item_id):
+                                        to_remove.append(i)
+                                
+                                # Удаляем в обратном порядке
+                                for idx in sorted(to_remove, reverse=True):
+                                    if idx < len(queue):
+                                        del queue[idx]
+                                
+                                user_verified_offers_queue[user_id] = queue
+                                
                                 if sent_count < len(signals):
                                     await asyncio.sleep(delay_seconds)
-                            else:
-                                skipped_count += 1
                         
                         if sent_count > 0:
-                            logger.info(f"Отправлено {sent_count} новых сигналов пользователю {user_id} (пропущено {skipped_count} дубликатов, задержка {delay_seconds}с)")
-                        else:
-                            logger.info(f"Новых сигналов нет для пользователя {user_id} (все {len(signals)} уже отправлены)")
+                            logger.info(f"📤 Отправлено {sent_count} сигналов пользователю {user_id}")
+                    
+                    # Небольшая пауза между пользователями
+                    await asyncio.sleep(1)
                 
-                await asyncio.sleep(15)
+                await asyncio.sleep(10)  # Основная пауза цикла
                 
             except asyncio.CancelledError:
                 logger.info("Цикл мониторинга отменен")
@@ -802,24 +731,19 @@ class P2PArbitrageBot:
         trade_amount = min(signal.seller.max_amount, signal.buyer.max_amount)
         usdt_amount = trade_amount / signal.seller.price if signal.seller.price > 0 else 0
         
-        # Генерируем ссылки на профили используя user_mask_id        seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
+        seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
         
-        # Определяем статус third_party
         seller_third_party = "✅ Готов" if signal.seller.third_party_ready else "❌ Не готов"
         buyer_third_party = "✅ Готов" if signal.buyer.third_party_ready else "❌ Не готов"
         
-        # Если есть анализ от Gemini, добавляем его
         seller_analysis = f"\n   📝 {signal.seller.third_party_analysis}" if signal.seller.third_party_analysis else ""
         buyer_analysis = f"\n   📝 {signal.buyer.third_party_analysis}" if signal.buyer.third_party_analysis else ""
         
-        # Логируем remark для обоих объявлений
-        logger.info(f"📝 SIGNAL REMARKS for user {user_id}:")
-        logger.info(f"   SELLER (merchant: {signal.seller.merchant_name}) REMARK: {signal.seller.remark}")
-        logger.info(f"   BUYER (merchant: {signal.buyer.merchant_name}) REMARK: {signal.buyer.remark}")
-        logger.info(f"   SELLER third_party: {signal.seller.third_party_ready}, BUYER third_party: {signal.buyer.third_party_ready}")
+        logger.info(f"📝 SIGNAL for user {user_id}:")
+        logger.info(f"   SELLER: {signal.seller.merchant_name} | third_party: {signal.seller.third_party_ready}")
+        logger.info(f"   BUYER: {signal.buyer.merchant_name} | third_party: {signal.buyer.third_party_ready}")
         
-        # Формируем сообщение
         message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
 
 🟢 ПРОДАВЕЦ (SELLER)
@@ -844,12 +768,7 @@ class P2PArbitrageBot:
 • Потенциальная прибыль: {signal.profit_rub:,.2f}₽"""
         
         try:
-            await self.bot.send_message(
-                user_id,
-                message,
-                parse_mode=None,
-                disable_web_page_preview=True
-            )
+            await self.bot.send_message(user_id, message, parse_mode=None, disable_web_page_preview=True)
         except Exception as e:
             logger.error(f"Ошибка отправки сигнала: {e}")
     
@@ -858,13 +777,12 @@ class P2PArbitrageBot:
         filters = user_filters.get(user_id, {})
         delay = user_signal_delay.get(user_id, 4)
         third_party_mode = user_third_party_mode.get(user_id, False)
+        queue_size = len(user_verified_offers_queue.get(user_id, deque()))
         
         if not filters:
-            return f"🔧 Фильтры не настроены. Используйте /help для настройки.\n\n⏱ Задержка между сигналами: {delay}с\n👤 Режим 3-их лиц: {'Включен' if third_party_mode else 'Выключен'}"
+            return f"🔧 Фильтры не настроены.\n\n⏱ Задержка: {delay}с\n👤 3-их лиц: {'Включен' if third_party_mode else 'Выключен'}\n📦 Объявлений в очереди: {queue_size}"
         
-        settings = []
-        settings.append("📋 <b>Текущие настройки фильтров:</b>")
-        settings.append("")
+        settings = ["📋 <b>Текущие настройки:</b>", ""]
         
         if filters.get("exact_amount"):
             settings.append(f"• Точная сумма: {filters['exact_amount']:.0f}₽")
@@ -875,31 +793,27 @@ class P2PArbitrageBot:
         if filters.get("min_spread"):
             settings.append(f"• Мин. спред: {filters['min_spread']}%")
         if filters.get("blacklist"):
-            settings.append(f"• Черный список (ники мерчантов): {', '.join(filters['blacklist'])}")
+            settings.append(f"• Черный список: {', '.join(filters['blacklist'])}")
         
         settings.append("")
-        settings.append(f"⏱ <b>Задержка между сигналами:</b> {delay}с")
-        settings.append(f"👤 <b>Режим 3-их лиц:</b> {'🟢 Включен (только готовые)' if third_party_mode else '🔴 Выключен (все)'}")
-        
-        if len(settings) == 3:
-            settings.append("⚠️ Фильтры настроены, но неактивны (запустите /start_monitoring)")
+        settings.append(f"⏱ Задержка: {delay}с")
+        settings.append(f"👤 3-их лиц: {'🟢 Включен' if third_party_mode else '🔴 Выключен'}")
+        settings.append(f"📦 Объявлений в очереди: {queue_size}")
         
         return "\n".join(settings)
 
 
-# Функция для установки команд бота
 async def set_bot_commands(bot: Bot):
-    """Устанавливает меню команд для бота"""
     commands = [
-        BotCommand(command="settings", description="📋 Показать текущие настройки фильтров"),
+        BotCommand(command="settings", description="📋 Показать настройки"),
         BotCommand(command="status", description="📊 Статус мониторинга"),
-        BotCommand(command="start_monitoring", description="▶️ Запустить мониторинг арбитража"),
+        BotCommand(command="start_monitoring", description="▶️ Запустить мониторинг"),
         BotCommand(command="stop_monitoring", description="⏹ Остановить мониторинг"),
-        BotCommand(command="delay", description="⏱ Установить задержку между сигналами (сек)"),
+        BotCommand(command="delay", description="⏱ Задержка между сигналами (сек)"),
         BotCommand(command="clear_filters", description="🧹 Очистить все фильтры"),
-        BotCommand(command="third_party_on", description="👤 Включить фильтр 3-их лиц (только готовые)"),
-        BotCommand(command="third_party_off", description="👤 Выключить фильтр 3-их лиц (все)"),
-        BotCommand(command="help", description="❓ Настройка фильтров"),
+        BotCommand(command="third_party_on", description="👤 Включить фильтр 3-их лиц"),
+        BotCommand(command="third_party_off", description="👤 Выключить фильтр 3-их лиц"),
+        BotCommand(command="help", description="❓ Помощь"),
     ]
     await bot.set_my_commands(commands)
     logger.info("✅ Меню команд установлено")
@@ -914,29 +828,25 @@ arbitrage_bot = P2PArbitrageBot(bot)
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    """Команда /start"""
     welcome_text = """
 🚀 Добро пожаловать в P2P Арбитраж Бот!
 
-Я ищу арбитражные связки на Bybit P2P и присылаю тебе сигналы.
-
 <b>Доступные команды:</b>
 /help - Настройка фильтров
-/settings - Текущие настройки фильтров
+/settings - Текущие настройки
 /status - Статус мониторинга
 /start_monitoring - Запустить мониторинг
 /stop_monitoring - Остановить мониторинг
-/delay - Установить задержку между сигналами
+/delay - Задержка между сигналами
 /clear_filters - Очистить все фильтры
 /third_party_on - Включить фильтр 3-их лиц
 /third_party_off - Выключить фильтр 3-их лиц
 
-<b>Как это работает:</b>
-1. Настрой фильтры через /help
-2. Запусти мониторинг /start_monitoring
-3. Бот будет искать выгодные связки
-4. При найденной связке получишь сигнал со ссылками на профили
-5. В сигнале будет указано, готов ли мерчант принимать платежи от 3-их лиц
+<b>Как работает оптимизация:</b>
+• Бот делает 1 запрос к Gemini для 5 продавцов и 5 покупателей
+• Результаты сохраняются в очередь
+• Сигналы отправляются из очереди
+• Когда очередь пуста - делается новый запрос
     """
     await safe_send_message(message, welcome_text)
     
@@ -946,90 +856,62 @@ async def cmd_start(message: Message):
         sent_signals[message.from_user.id] = {}
         user_signal_delay[message.from_user.id] = 4
         user_third_party_mode[message.from_user.id] = False
+        user_verified_offers_queue[message.from_user.id] = deque()
+        user_analysis_in_progress[message.from_user.id] = False
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    """Команда /help"""
     help_text = """
 📖 <b>Помощь по фильтрам</b>
-
-<b>Что можно настраивать:</b>
 
 1. <b>Сумма сделки</b>
    /set_exact 28000 - строго 28 000 ₽
    /set_min 25000 - минимум 25 000 ₽
    /set_max 30000 - максимум 30 000 ₽
 
-2. <b>Черный список (исключаем по никам мерчантов)</b>
-   /add_blacklist "Имя Мерчанта" - НЕ показывать объявления этого мерчанта
-   /add_blacklist Мошенник - НЕ показывать объявления мерчантов с этим словом в нике
-   /remove_blacklist "Имя Мерчанта" - убрать из черного списка
-   
-   <b>⚠️ ВАЖНО:</b> Черный список работает ТОЛЬКО с никами мерчантов!
-   • Bybit API НЕ передает текстовые условия/описания объявлений
-   • Черный список НЕ может фильтровать по описанию или условиям мейкера
-   • Если хотите исключить мерчанта - добавьте его полный ник или часть ника
+2. <b>Черный список</b>
+   /add_blacklist "Имя" - добавить мерчанта
+   /remove_blacklist "Имя" - удалить
 
 3. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
 
-4. <b>Задержка между сигналами</b>
-   /delay 5 - установить задержку 5 секунд между отправками сигналов
-   /delay 2 - установить задержку 2 секунды (быстрее)
-   /delay 10 - установить задержку 10 секунд (медленнее)
-   
-   <b>⚠️ ВАЖНО:</b> Если задержка слишком маленькая (1-2с), 
-   вы можете получить много сообщений подряд. Рекомендуем 3-5 секунд.
+4. <b>Задержка</b>
+   /delay 5 - задержка 5 секунд
 
-5. <b>Режим 3-их лиц (Third Party)</b>
-   /third_party_on - Включить фильтр (только объявления с готовностью к платежам от 3-их лиц)
-   /third_party_off - Выключить фильтр (все объявления)
-   
-   <b>🤖 Как работает:</b>
-   • Бот использует AI (Gemini) для анализа текста объявления (remark)
-   • Определяет, готов ли мерчант принимать платежи от 3-их лиц
-   • Если в объявлении нет явного запрета, считается, что готов
-   • В сигнале будет указан статус для продавца и покупателя
+5. <b>Режим 3-их лиц</b>
+   /third_party_on - Только готовые к 3-им лицам
+   /third_party_off - Все объявления
 
 6. <b>Управление</b>
-   /start_monitoring - запуск поиска
-   /stop_monitoring - остановка поиска
+   /start_monitoring - запуск
+   /stop_monitoring - остановка
    /status - текущий статус
    /clear_filters - очистить все фильтры
 
-<b>Важно про кавычки!</b>
-Если имя мерчанта состоит из нескольких слов, заключите его в кавычки:
-/add_blacklist "ALL FOR ALL"
-/add_blacklist "Иван Петров"
-
-<b>Пример настройки:</b>
+<b>Пример:</b>
 1. /set_min 500
 2. /set_max 10000
 3. /set_spread 0.5
 4. /delay 5
-5. /add_blacklist "Мошенник Иван"
-6. /add_blacklist "ALL FOR ALL"
-7. /third_party_on
-8. /start_monitoring
+5. /third_party_on
+6. /start_monitoring
     """
     await safe_send_message(message, help_text)
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
-    """Показать текущие настройки"""
     settings_text = await arbitrage_bot.get_filter_settings(message.from_user.id)
     await safe_send_message(message, settings_text)
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
-    """Статус мониторинга"""
     user_id = message.from_user.id
     is_active = user_subscriptions.get(user_id, False)
     status_emoji = "🟢" if is_active else "🔴"
     status_text = "Активен" if is_active else "Остановлен"
     
     settings_preview = await arbitrage_bot.get_filter_settings(user_id)
-    
     signals_count = len(sent_signals.get(user_id, {}))
     
     status_message = f"""
@@ -1042,138 +924,83 @@ async def cmd_status(message: Message):
 
 @dp.message(Command("start_monitoring"))
 async def cmd_start_monitoring(message: Message):
-    """Запуск мониторинга"""
     user_id = message.from_user.id
     filters = user_filters.get(user_id, {})
     
     if not filters:
-        await safe_send_message(
-            message,
-            "⚠️ Сначала настройте фильтры!\n"
-            "Используйте /help для настройки и /settings для просмотра."
-        )
+        await safe_send_message(message, "⚠️ Сначала настройте фильтры через /help")
         return
     
-    # Очищаем старые сигналы при новом запуске
     sent_signals[user_id] = {}
-    
+    user_verified_offers_queue[user_id] = deque()
+    user_analysis_in_progress[user_id] = False
     user_subscriptions[user_id] = True
+    
     delay = user_signal_delay.get(user_id, 4)
     third_party_mode = user_third_party_mode.get(user_id, False)
-    
-    third_party_status = "включен (только готовые)" if third_party_mode else "выключен (все)"
     
     await safe_send_message(
         message,
         f"✅ Мониторинг запущен!\n"
-        f"Бот будет присылать сигналы при нахождении выгодных связок.\n"
-        f"⏱ Задержка между сигналами: {delay}с\n"
-        f"👤 Режим 3-их лиц: {third_party_status}\n"
-        f"Для остановки используйте: /stop_monitoring"
+        f"⏱ Задержка: {delay}с\n"
+        f"👤 3-их лиц: {'Включен' if third_party_mode else 'Выключен'}\n"
+        f"📦 Объявления анализируются порциями по 5+5"
     )
 
 @dp.message(Command("stop_monitoring"))
 async def cmd_stop_monitoring(message: Message):
-    """Остановка мониторинга"""
     user_id = message.from_user.id
-    
-    # Немедленно останавливаем для этого пользователя
     user_subscriptions[user_id] = False
+    sent_signals[user_id] = {}
+    user_verified_offers_queue[user_id] = deque()
     
-    # Очищаем кэш отправленных сигналов
-    if user_id in sent_signals:
-        sent_signals[user_id].clear()
-    
-    await safe_send_message(
-        message, 
-        "⏹ Мониторинг остановлен.\n"
-        "Все активные задачи для вас отменены."
-    )
+    await safe_send_message(message, "⏹ Мониторинг остановлен.")
 
 @dp.message(Command("delay"))
 async def cmd_delay(message: Message):
-    """Установка задержки между сигналами"""
     try:
         args = parse_args_with_quotes(message.text)
         if len(args) != 2:
-            await safe_send_message(
-                message, 
-                "❌ Использование: /delay <секунды>\n"
-                "Пример: /delay 5\n\n"
-                "Рекомендуемые значения:\n"
-                "• 3-5 секунд - оптимально\n"
-                "• 1-2 секунды - очень быстро (может быть много сообщений)\n"
-                "• 8-10 секунд - медленно (меньше сообщений)"
-            )
+            await safe_send_message(message, "❌ Использование: /delay <секунды>\nПример: /delay 5")
             return
         
         delay = float(args[1])
-        if delay < 1:
-            await safe_send_message(
-                message, 
-                "❌ Задержка должна быть не менее 1 секунды"
-            )
-            return
-        
-        if delay > 60:
-            await safe_send_message(
-                message, 
-                "❌ Задержка не может превышать 60 секунд"
-            )
+        if delay < 1 or delay > 60:
+            await safe_send_message(message, "❌ Задержка должна быть от 1 до 60 секунд")
             return
         
         user_id = message.from_user.id
         user_signal_delay[user_id] = delay
         
-        await safe_send_message(
-            message, 
-            f"⏱ Задержка между сигналами установлена: {delay}с\n\n"
-            f"Теперь бот будет отправлять сигналы с интервалом {delay} секунд.\n"
-            f"Это поможет избежать спама при большом количестве сигналов."
-        )
+        await safe_send_message(message, f"⏱ Задержка установлена: {delay}с")
     except ValueError:
-        await safe_send_message(
-            message, 
-            "❌ Введите корректное число секунд\n"
-            "Пример: /delay 5"
-        )
+        await safe_send_message(message, "❌ Введите корректное число")
 
 @dp.message(Command("clear_filters"))
 async def cmd_clear_filters(message: Message):
-    """Очистка всех фильтров"""
     user_id = message.from_user.id
     user_filters[user_id] = {}
     user_subscriptions[user_id] = False
     sent_signals[user_id] = {}
-    # Задержку и режим third_party НЕ сбрасываем
-    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен. Задержка и режим 3-их лиц сохранены.")
+    user_verified_offers_queue[user_id] = deque()
+    
+    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен.")
 
 @dp.message(Command("third_party_on"))
 async def cmd_third_party_on(message: Message):
-    """Включение фильтра третьих лиц"""
     user_id = message.from_user.id
     user_third_party_mode[user_id] = True
+    user_verified_offers_queue[user_id] = deque()  # Очищаем очередь
     
-    await safe_send_message(
-        message,
-        f"👤 Режим 3-их лиц ВКЛЮЧЕН!\n\n"
-        f"Теперь бот будет показывать ТОЛЬКО объявления, где мерчанты готовы принимать платежи от 3-их лиц.\n"
-        f"Если в объявлении нет явного запрета на платежи от 3-их лиц, оно будет показано.\n\n"
-        f"Для отключения используйте: /third_party_off"
-    )
+    await safe_send_message(message, "👤 Режим 3-их лиц ВКЛЮЧЕН!")
 
 @dp.message(Command("third_party_off"))
 async def cmd_third_party_off(message: Message):
-    """Выключение фильтра третьих лиц"""
     user_id = message.from_user.id
     user_third_party_mode[user_id] = False
+    user_verified_offers_queue[user_id] = deque()
     
-    await safe_send_message(
-        message,
-        f"👤 Режим 3-их лиц ВЫКЛЮЧЕН!\n\n"
-        f"Теперь бот будет показывать ВСЕ объявления, независимо от готовности к платежам от 3-их лиц.\n\n"
-        f"Для включения используйте: /third_party_on"
-    )
+    await safe_send_message(message, "👤 Режим 3-их лиц ВЫКЛЮЧЕН!")
 
 # --- Команды для настройки фильтров ---
 
@@ -1182,23 +1009,19 @@ async def cmd_set_exact(message: Message):
     try:
         args = parse_args_with_quotes(message.text)
         if len(args) != 2:
-            await safe_send_message(message, "❌ Использование: /set_exact <сумма>\nПример: /set_exact 28000")
+            await safe_send_message(message, "❌ Использование: /set_exact <сумма>")
             return
-        
         amount = float(args[1])
         if amount <= 0:
             await safe_send_message(message, "❌ Сумма должна быть положительной")
             return
-        
         user_id = message.from_user.id
         if user_id not in user_filters:
             user_filters[user_id] = {}
-        
         user_filters[user_id].pop("min_amount", None)
         user_filters[user_id].pop("max_amount", None)
         user_filters[user_id]["exact_amount"] = amount
-        
-        await safe_send_message(message, f"✅ Установлена точная сумма: {amount:,.0f}₽")
+        await safe_send_message(message, f"✅ Точная сумма: {amount:,.0f}₽")
     except ValueError:
         await safe_send_message(message, "❌ Введите корректное число")
 
@@ -1207,22 +1030,18 @@ async def cmd_set_min(message: Message):
     try:
         args = parse_args_with_quotes(message.text)
         if len(args) != 2:
-            await safe_send_message(message, "❌ Использование: /set_min <сумма>\nПример: /set_min 25000")
+            await safe_send_message(message, "❌ Использование: /set_min <сумма>")
             return
-        
         amount = float(args[1])
         if amount <= 0:
             await safe_send_message(message, "❌ Сумма должна быть положительной")
             return
-        
         user_id = message.from_user.id
         if user_id not in user_filters:
             user_filters[user_id] = {}
-        
         user_filters[user_id].pop("exact_amount", None)
         user_filters[user_id]["min_amount"] = amount
-        
-        await safe_send_message(message, f"✅ Установлена минимальная сумма: {amount:,.0f}₽")
+        await safe_send_message(message, f"✅ Минимальная сумма: {amount:,.0f}₽")
     except ValueError:
         await safe_send_message(message, "❌ Введите корректное число")
 
@@ -1231,22 +1050,18 @@ async def cmd_set_max(message: Message):
     try:
         args = parse_args_with_quotes(message.text)
         if len(args) != 2:
-            await safe_send_message(message, "❌ Использование: /set_max <сумма>\nПример: /set_max 30000")
+            await safe_send_message(message, "❌ Использование: /set_max <сумма>")
             return
-        
         amount = float(args[1])
         if amount <= 0:
             await safe_send_message(message, "❌ Сумма должна быть положительной")
             return
-        
         user_id = message.from_user.id
         if user_id not in user_filters:
             user_filters[user_id] = {}
-        
         user_filters[user_id].pop("exact_amount", None)
         user_filters[user_id]["max_amount"] = amount
-        
-        await safe_send_message(message, f"✅ Установлена максимальная сумма: {amount:,.0f}₽")
+        await safe_send_message(message, f"✅ Максимальная сумма: {amount:,.0f}₽")
     except ValueError:
         await safe_send_message(message, "❌ Введите корректное число")
 
@@ -1255,21 +1070,17 @@ async def cmd_set_spread(message: Message):
     try:
         args = parse_args_with_quotes(message.text)
         if len(args) != 2:
-            await safe_send_message(message, "❌ Использование: /set_spread <процент>\nПример: /set_spread 0.5")
+            await safe_send_message(message, "❌ Использование: /set_spread <процент>")
             return
-        
         spread = float(args[1])
         if spread < 0:
             await safe_send_message(message, "❌ Спред должен быть положительным")
             return
-        
         user_id = message.from_user.id
         if user_id not in user_filters:
             user_filters[user_id] = {}
-        
         user_filters[user_id]["min_spread"] = spread
-        
-        await safe_send_message(message, f"✅ Установлен минимальный спред: {spread}%")
+        await safe_send_message(message, f"✅ Минимальный спред: {spread}%")
     except ValueError:
         await safe_send_message(message, "❌ Введите корректное число")
 
@@ -1277,34 +1088,17 @@ async def cmd_set_spread(message: Message):
 async def cmd_add_blacklist(message: Message):
     args = parse_args_with_quotes(message.text)
     if len(args) != 2:
-        await safe_send_message(
-            message, 
-            "❌ Использование: /add_blacklist <ник мерчанта>\n"
-            "Пример: /add_blacklist Мошенник\n"
-            "Пример с кавычками: /add_blacklist \"ALL FOR ALL\"\n\n"
-            "⚠️ Черный список работает ТОЛЬКО с никами мерчантов!\n"
-            "Bybit API не передает описания/условия, поэтому фильтр по ним невозможен."
-        )
+        await safe_send_message(message, "❌ Использование: /add_blacklist <ник>")
         return
-    
     word = args[1]
     user_id = message.from_user.id
     if user_id not in user_filters:
         user_filters[user_id] = {}
-    
     if "blacklist" not in user_filters[user_id]:
         user_filters[user_id]["blacklist"] = []
-    
     if word not in user_filters[user_id]["blacklist"]:
         user_filters[user_id]["blacklist"].append(word)
-        await safe_send_message(
-            message, 
-            f"✅ Добавлено в ЧЕРНЫЙ список: {word}\n"
-            f"Теперь бот НЕ будет показывать объявления мерчантов с этим словом в нике\n"
-            f"(проверяется только ник мерчанта)\n\n"
-            f"⚠️ Напоминание: черный список НЕ фильтрует описание/условия объявлений,\n"
-            f"так как Bybit API не предоставляет эту информацию в публичных объявлениях."
-        )
+        await safe_send_message(message, f"✅ Добавлено в черный список: {word}")
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' уже в черном списке")
 
@@ -1312,37 +1106,32 @@ async def cmd_add_blacklist(message: Message):
 async def cmd_remove_blacklist(message: Message):
     args = parse_args_with_quotes(message.text)
     if len(args) != 2:
-        await safe_send_message(message, "❌ Использование: /remove_blacklist <ник>\nПример: /remove_blacklist Мошенник")
+        await safe_send_message(message, "❌ Использование: /remove_blacklist <ник>")
         return
-    
     word = args[1]
     user_id = message.from_user.id
     if user_id not in user_filters or "blacklist" not in user_filters[user_id]:
         await safe_send_message(message, "⚠️ Черный список пуст")
         return
-    
     if word in user_filters[user_id]["blacklist"]:
         user_filters[user_id]["blacklist"].remove(word)
         await safe_send_message(message, f"✅ Удалено из черного списка: {word}")
         if not user_filters[user_id]["blacklist"]:
             del user_filters[user_id]["blacklist"]
     else:
-        await safe_send_message(message, f"⚠️ Слово '{word}' не найдено в черном списке")
+        await safe_send_message(message, f"⚠️ Слово '{word}' не найдено")
 
 
 async def on_startup():
-    """Действия при запуске бота"""
     await set_bot_commands(bot)
     await arbitrage_bot.start()
     logger.info("Бот запущен и готов к работе!")
 
 async def on_shutdown():
-    """Действия при остановке бота"""
     await arbitrage_bot.stop()
     logger.info("Бот остановлен")
 
 async def main():
-    """Главная функция"""
     try:
         await on_startup()
         await dp.start_polling(bot)
