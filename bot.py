@@ -139,6 +139,7 @@ class P2POffer:
     item_id: str
     user_id: str
     user_mask_id: str
+    remark: str = ""  # Добавлено поле для remark
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -250,6 +251,9 @@ class BybitP2PClient:
                 user_id = str(item.get("uid", ""))
                 user_mask_id = str(item.get("userMaskId", ""))
                 
+                # Получаем remark из объявления
+                remark = item.get("remark", "")
+                
                 offer = P2POffer(
                     side=side,
                     price=price,
@@ -262,7 +266,8 @@ class BybitP2PClient:
                     merchant_name=item.get("nickName", "Аноним"),
                     item_id=item_id,
                     user_id=user_id,
-                    user_mask_id=user_mask_id
+                    user_mask_id=user_mask_id,
+                    remark=remark
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
@@ -593,6 +598,11 @@ class P2PArbitrageBot:
         # Генерируем ссылки на профили используя user_mask_id
         seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
+        
+        # Логируем remark для обоих объявлений
+        logger.info(f"📝 SIGNAL REMARKS for user {user_id}:")
+        logger.info(f"   SELLER (merchant: {signal.seller.merchant_name}) REMARK: {signal.seller.remark}")
+        logger.info(f"   BUYER (merchant: {signal.buyer.merchant_name}) REMARK: {signal.buyer.remark}")
         
         # Формируем сообщение
         message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
@@ -1083,4 +1093,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
