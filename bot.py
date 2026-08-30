@@ -78,6 +78,42 @@ user_verified_offers_queue: Dict[int, deque] = {}
 # Флаг, указывающий, что идет процесс анализа для пользователя
 user_analysis_in_progress: Dict[int, bool] = {}
 
+# ========== ОПРЕДЕЛЕНИЕ DATACLASSES ==========
+
+@dataclass
+class P2POffer:
+    """Класс для хранения данных P2P-объявления"""
+    side: str
+    price: float
+    amount: float
+    min_amount: float
+    max_amount: float
+    payment_methods: List[str]
+    description: str
+    link: str
+    merchant_name: str
+    item_id: str
+    user_id: str
+    user_mask_id: str
+    remark: str = ""
+    third_party_ready: bool = True
+    third_party_analysis: str = ""
+    token: str = "USDT"
+    fiat: str = "RUB"
+
+@dataclass
+class ArbitrageSignal:
+    """Класс для хранения сигнала арбитража"""
+    seller: P2POffer
+    buyer: P2POffer
+    spread: float
+    profit: float
+    profit_rub: float
+    timestamp: datetime
+    signal_id: str
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
 # Вспомогательная функция для парсинга аргументов с поддержкой кавычек
 def parse_args_with_quotes(text: str) -> List[str]:
     """
@@ -134,6 +170,8 @@ async def safe_send_message(message: Message, text: str):
     except Exception as e:
         logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
         await message.answer(text.replace('<', '[').replace('>', ']'))
+
+# ========== ФУНКЦИЯ АНАЛИЗА GEMINI ==========
 
 # Функция для массового анализа remark через Gemini (ОДИН ЗАПРОС)
 async def analyze_remarks_batch(offers: List[Tuple[P2POffer, str]]) -> Dict[str, Dict[str, any]]:
@@ -192,12 +230,12 @@ async def analyze_remarks_batch(offers: List[Tuple[P2POffer, str]]) -> Dict[str,
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: gemini_client.models.generate_content(
-                model='gemini-3.6-flash',  # Используем указанную модель
+                model='gemini-3.6-flash',
                 contents=full_prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     top_p=0.8,
-                    max_output_tokens=800,  # Достаточно для нескольких объявлений
+                    max_output_tokens=800,
                 )
             )
         )
@@ -226,44 +264,14 @@ async def analyze_remarks_batch(offers: List[Tuple[P2POffer, str]]) -> Dict[str,
             logger.info(f"✅ Успешно проанализировано {len(result_dict)} объявлений")
             return result_dict
         else:
-            logger.warning(f"⚠️ Не удалось распарсить ответ Gemini")
+            logger.warning(f"⚠️ Не удалось распарсить ответ Gemini: {result_text[:200]}")
             return {}
             
     except Exception as e:
         logger.error(f"❌ Ошибка при массовом анализе Gemini: {e}")
         return {}
 
-@dataclass
-class P2POffer:
-    """Класс для хранения данных P2P-объявления"""
-    side: str
-    price: float
-    amount: float
-    min_amount: float
-    max_amount: float
-    payment_methods: List[str]
-    description: str
-    link: str
-    merchant_name: str
-    item_id: str
-    user_id: str
-    user_mask_id: str
-    remark: str = ""
-    third_party_ready: bool = True
-    third_party_analysis: str = ""
-    token: str = "USDT"
-    fiat: str = "RUB"
-
-@dataclass
-class ArbitrageSignal:
-    """Класс для хранения сигнала арбитража"""
-    seller: P2POffer
-    buyer: P2POffer
-    spread: float
-    profit: float
-    profit_rub: float
-    timestamp: datetime
-    signal_id: str
+# ========== КЛАСС BYBIT P2P КЛИЕНТ ==========
 
 class BybitP2PClient:
     """Клиент для работы с P2P API Bybit"""
@@ -387,6 +395,8 @@ class BybitP2PClient:
         
         logger.info(f"Получено {len(offers)} объявлений для {side}")
         return offers
+
+# ========== ОСНОВНОЙ КЛАСС БОТА ==========
 
 class P2PArbitrageBot:
     """Основной класс бота для P2P арбитража"""
@@ -803,6 +813,8 @@ class P2PArbitrageBot:
         return "\n".join(settings)
 
 
+# ========== НАСТРОЙКА КОМАНД БОТА ==========
+
 async def set_bot_commands(bot: Bot):
     commands = [
         BotCommand(command="settings", description="📋 Показать настройки"),
@@ -819,12 +831,13 @@ async def set_bot_commands(bot: Bot):
     logger.info("✅ Меню команд установлено")
 
 
-# Инициализация бота
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА ==========
+
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 arbitrage_bot = P2PArbitrageBot(bot)
 
-# --- Обработчики команд ---
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -990,7 +1003,7 @@ async def cmd_clear_filters(message: Message):
 async def cmd_third_party_on(message: Message):
     user_id = message.from_user.id
     user_third_party_mode[user_id] = True
-    user_verified_offers_queue[user_id] = deque()  # Очищаем очередь
+    user_verified_offers_queue[user_id] = deque()
     
     await safe_send_message(message, "👤 Режим 3-их лиц ВКЛЮЧЕН!")
 
@@ -1002,7 +1015,7 @@ async def cmd_third_party_off(message: Message):
     
     await safe_send_message(message, "👤 Режим 3-их лиц ВЫКЛЮЧЕН!")
 
-# --- Команды для настройки фильтров ---
+# ========== КОМАНДЫ НАСТРОЙКИ ФИЛЬТРОВ ==========
 
 @dp.message(Command("set_exact"))
 async def cmd_set_exact(message: Message):
@@ -1121,6 +1134,8 @@ async def cmd_remove_blacklist(message: Message):
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' не найдено")
 
+
+# ========== ЗАПУСК БОТА ==========
 
 async def on_startup():
     await set_bot_commands(bot)
