@@ -486,29 +486,57 @@ class P2PArbitrageBot:
             return "Ссылка недоступна"
         return f"https://www.bybit.com/ru-RU/p2p/order/{item_id}"
     
-    async def _analyze_with_gemini_if_needed(self, offer: P2POffer, user_id: int) -> P2POffer:
-        """Анализирует объявление через Gemini только если включено для пользователя"""
+    async def _analyze_offers_with_gemini(self, sellers: List[P2POffer], buyers: List[P2POffer], user_id: int) -> Tuple[List[P2POffer], List[P2POffer]]:
+        """Анализирует объявления через Gemini для пользователя"""
         gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         
         if not gemini_enabled or not gemini_client:
-            # Если Gemini выключен или недоступен - пропускаем
-            offer.third_party_ready = True
-            offer.third_party_analysis = ""
-            return offer
+            # Если Gemini выключен - просто помечаем все как готовые
+            for seller in sellers:
+                seller.third_party_ready = True
+                seller.third_party_analysis = ""
+            for buyer in buyers:
+                buyer.third_party_ready = True
+                buyer.third_party_analysis = ""
+            return sellers, buyers
         
-        # Если уже есть анализ в кэше
-        cache_key = f"{offer.item_id}_{offer.merchant_name}"
-        if cache_key in gemini_cache:
-            result = gemini_cache[cache_key]
-            offer.third_party_ready = result.get("third_party_ready", True)
-            offer.third_party_analysis = result.get("analysis", "")
-            return offer
+        # Анализируем объявления с remark (только топ-10 для экономии)
+        sellers_with_remark = [s for s in sellers if s.remark and s.remark.strip()][:10]
+        buyers_with_remark = [b for b in buyers if b.remark and b.remark.strip()][:10]
         
-        # Анализируем через Gemini
-        result = await analyze_with_gemini(offer.remark, offer.merchant_name, offer.item_id)
-        offer.third_party_ready = result.get("third_party_ready", True)
-        offer.third_party_analysis = result.get("analysis", "")
-        return offer
+        # Анализируем продавцов
+        for seller in sellers_with_remark:
+            cache_key = f"{seller.item_id}_{seller.merchant_name}"
+            if cache_key not in gemini_cache:
+                await analyze_with_gemini(seller.remark, seller.merchant_name, seller.item_id)
+        
+        # Анализируем покупателей
+        for buyer in buyers_with_remark:
+            cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
+            if cache_key not in gemini_cache:
+                await analyze_with_gemini(buyer.remark, buyer.merchant_name, buyer.item_id)
+        
+        # Применяем результаты ко всем объявлениям
+        for seller in sellers:
+            cache_key = f"{seller.item_id}_{seller.merchant_name}"
+            if cache_key in gemini_cache:
+                seller.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
+                seller.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
+            else:
+                # Если не анализировали - считаем готовым
+                seller.third_party_ready = True
+                seller.third_party_analysis = ""
+        
+        for buyer in buyers:
+            cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
+            if cache_key in gemini_cache:
+                buyer.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
+                buyer.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
+            else:
+                buyer.third_party_ready = True
+                buyer.third_party_analysis = ""
+        
+        return sellers, buyers
     
     def _find_all_arbitrage_signals(self, sellers: List[P2POffer], buyers: List[P2POffer],
                                      user_filters: Dict, user_id: int) -> List[ArbitrageSignal]:
@@ -526,17 +554,9 @@ class P2PArbitrageBot:
             if passes:
                 # Если Gemini включен - проверяем seller
                 if gemini_enabled and gemini_client:
-                    # Проверяем через Gemini
-                    cache_key = f"{seller.item_id}_{seller.merchant_name}"
-                    if cache_key in gemini_cache:
-                        seller.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                        seller.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
-                    else:
-                        # Пропускаем seller, если еще не проанализирован (анализ будет позже)
-                        continue
-                    
                     # Если seller не готов к платежам от 3-их лиц - пропускаем
                     if not seller.third_party_ready:
+                        logger.debug(f"❌ Seller {seller.merchant_name} не готов к 3-им лицам - пропускаем")
                         continue
                 
                 filtered_sellers.append(seller)
@@ -547,21 +567,15 @@ class P2PArbitrageBot:
             if passes:
                 # Если Gemini включен - проверяем buyer
                 if gemini_enabled and gemini_client:
-                    cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
-                    if cache_key in gemini_cache:
-                        buyer.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                        buyer.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
-                    else:
-                        # Пропускаем buyer, если еще не проанализирован
-                        continue
-                    
                     # Если buyer не готов к платежам от 3-их лиц - пропускаем
                     if not buyer.third_party_ready:
+                        logger.debug(f"❌ Buyer {buyer.merchant_name} не готов к 3-им лицам - пропускаем")
                         continue
                 
                 filtered_buyers.append(buyer)
         
         if not filtered_sellers or not filtered_buyers:
+            logger.info(f"⚠️ Нет подходящих объявлений после фильтрации")
             return []
         
         # Сортируем продавцов по возрастанию цены (самые дешевые сверху)
@@ -637,44 +651,6 @@ class P2PArbitrageBot:
         
         if old_signals:
             logger.debug(f"Очищено {len(old_signals)} старых сигналов для пользователя {user_id}")
-    
-    async def _analyze_offers_with_gemini(self, sellers: List[P2POffer], buyers: List[P2POffer], user_id: int) -> Tuple[List[P2POffer], List[P2POffer]]:
-        """Анализирует объявления через Gemini для пользователя"""
-        gemini_enabled = gemini_enabled_for_user.get(user_id, False)
-        
-        if not gemini_enabled or not gemini_client:
-            return sellers, buyers
-        
-        # Анализируем только объявления с remark
-        sellers_to_analyze = [s for s in sellers if s.remark and s.remark.strip()]
-        buyers_to_analyze = [b for b in buyers if b.remark and b.remark.strip()]
-        
-        # Анализируем продавцов
-        for seller in sellers_to_analyze[:5]:  # Анализируем только топ-5
-            cache_key = f"{seller.item_id}_{seller.merchant_name}"
-            if cache_key not in gemini_cache:
-                await analyze_with_gemini(seller.remark, seller.merchant_name, seller.item_id)
-        
-        # Анализируем покупателей
-        for buyer in buyers_to_analyze[:5]:
-            cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
-            if cache_key not in gemini_cache:
-                await analyze_with_gemini(buyer.remark, buyer.merchant_name, buyer.item_id)
-        
-        # Применяем результаты
-        for seller in sellers:
-            cache_key = f"{seller.item_id}_{seller.merchant_name}"
-            if cache_key in gemini_cache:
-                seller.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                seller.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
-        
-        for buyer in buyers:
-            cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
-            if cache_key in gemini_cache:
-                buyer.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                buyer.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
-        
-        return sellers, buyers
     
     async def _monitor_loop(self):
         """Основной цикл мониторинга"""
@@ -776,6 +752,8 @@ class P2PArbitrageBot:
                             logger.info(f"Отправлено {sent_count} новых сигналов пользователю {user_id} (пропущено {skipped_count} дубликатов, задержка {delay_seconds}с)")
                         else:
                             logger.info(f"Новых сигналов нет для пользователя {user_id} (все {len(signals)} уже отправлены)")
+                    else:
+                        logger.info(f"ℹ️ Сигналов не найдено для пользователя {user_id}")
                 
                 await asyncio.sleep(15)
                 
