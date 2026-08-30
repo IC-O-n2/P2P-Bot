@@ -20,6 +20,9 @@ from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
+# Импорт для Gemini
+import google.generativeai as genai
+
 # Загрузка переменных окружения
 load_dotenv()
 
@@ -34,12 +37,22 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не найден в переменных окружения")
 
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     logger.warning("⚠️ API ключи Bybit не найдены! Бот будет работать в ограниченном режиме.")
+
+if not GEMINI_API_KEY:
+    logger.warning("⚠️ API ключ Gemini не найден! Анализ remark будет отключен.")
+else:
+    # Инициализация Gemini
+    genai.configure(api_key=GEMINI_API_KEY)
+    # Используем бесплатную модель
+    gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+    logger.info("✅ Gemini инициализирован")
 
 # Хранилище для фильтров пользователей
 user_filters: Dict[int, Dict] = {}
@@ -50,6 +63,11 @@ sent_signals: Dict[int, Dict[str, datetime]] = {}
 
 # Хранилище для настроек задержки между сигналами (по умолчанию 4 секунды)
 user_signal_delay: Dict[int, int] = {}
+
+# Хранилище для режимов анализа third_party
+# True - фильтровать только объявления с явным указанием готовности к платежам от 3-их лиц
+# False - показывать все объявления (режим по умолчанию)
+user_third_party_mode: Dict[int, bool] = {}
 
 # Вспомогательная функция для парсинга аргументов с поддержкой кавычек
 def parse_args_with_quotes(text: str) -> List[str]:
@@ -124,6 +142,81 @@ async def safe_send_message(message: Message, text: str):
         logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
         await message.answer(text.replace('<', '[').replace('>', ']'))
 
+# Функция для анализа remark с помощью Gemini
+async def analyze_remark_with_gemini(remark: str, merchant_name: str) -> Dict[str, any]:
+    """
+    Анализирует remark объявления с помощью Gemini для определения:
+    1. Готов ли мерчант принимать платежи от 3-их лиц
+    2. Дополнительная информация о платежах
+    """
+    if not GEMINI_API_KEY or not remark or remark.strip() == "":
+        # Если нет API ключа или remark пустой - возвращаем стандартный ответ
+        return {
+            "third_party_ready": True,  # По умолчанию считаем, что готов
+            "confidence": 0.5,
+            "analysis": "Нет данных для анализа",
+            "raw_remark": remark
+        }
+    
+    try:
+        # Промпт для Gemini
+        prompt = f"""
+Проанализируй следующий текст (remark) от пользователя {merchant_name} на P2P платформе Bybit.
+Текст: "{remark}"
+
+Определи, готов ли этот мерчант принимать платежи от ТРЕТЬИХ ЛИЦ (third-party payments).
+Третьи лица - это когда платеж за USDT совершает не сам покупатель, а другое лицо (друг, родственник, коллега и т.д.).
+
+Критерии оценки:
+1. Если в тексте явно указано, что мерчант НЕ принимает платежи от третьих лиц -> third_party_ready = False
+2. Если в тексте явно указано, что мерчант ПРИНИМАЕТ платежи от третьих лиц -> third_party_ready = True
+3. Если в тексте сказано что-то вроде "только от своего имени", "платежи только от себя", "только свои карты" и т.д. -> third_party_ready = False
+4. Если в тексте НЕТ явного указания о третьих лицах -> third_party_ready = True (по умолчанию)
+
+Верни ответ в формате JSON:
+{{
+    "third_party_ready": true/false,
+    "confidence": 0.0-1.0 (насколько ты уверен в своем ответе),
+    "analysis": "краткий анализ текста (1-2 предложения на русском)",
+    "key_phrases": ["фразы", "которые", "повлияли", "на", "решение"]
+}}
+
+Важно: Если в тексте нет упоминаний о третьих лицах, возвращай third_party_ready = True.
+"""
+        
+        # Делаем запрос к Gemini
+        response = await asyncio.get_event_loop().run_in_executor(
+            None, 
+            lambda: gemini_model.generate_content(prompt)
+        )
+        
+        # Парсим ответ
+        result_text = response.text.strip()
+        
+        # Пытаемся извлечь JSON из ответа
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            logger.info(f"✅ Gemini анализ для {merchant_name}: third_party={result.get('third_party_ready')}, confidence={result.get('confidence')}")
+            return result
+        else:
+            logger.warning(f"⚠️ Не удалось распарсить ответ Gemini: {result_text[:200]}")
+            return {
+                "third_party_ready": True,
+                "confidence": 0.5,
+                "analysis": "Не удалось проанализировать",
+                "raw_remark": remark
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка при анализе Gemini: {e}")
+        return {
+            "third_party_ready": True,  # В случае ошибки пропускаем объявление
+            "confidence": 0.5,
+            "analysis": f"Ошибка анализа: {str(e)[:100]}",
+            "raw_remark": remark
+        }
+
 @dataclass
 class P2POffer:
     """Класс для хранения данных P2P-объявления"""
@@ -139,7 +232,10 @@ class P2POffer:
     item_id: str
     user_id: str
     user_mask_id: str
-    remark: str = ""  # Добавлено поле для remark
+    remark: str = ""
+    # Поля для результатов анализа Gemini
+    third_party_ready: bool = True
+    third_party_analysis: str = ""
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -267,7 +363,9 @@ class BybitP2PClient:
                     item_id=item_id,
                     user_id=user_id,
                     user_mask_id=user_mask_id,
-                    remark=remark
+                    remark=remark,
+                    third_party_ready=True,  # По умолчанию
+                    third_party_analysis=""
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
@@ -381,6 +479,57 @@ class P2PArbitrageBot:
         if not item_id or item_id == "0" or item_id == "":
             return "Ссылка недоступна"
         return f"https://www.bybit.com/ru-RU/p2p/order/{item_id}"
+    
+    async def _analyze_offers_with_gemini(self, sellers: List[P2POffer], buyers: List[P2POffer]) -> Tuple[List[P2POffer], List[P2POffer]]:
+        """Анализирует все объявления через Gemini для определения third_party_ready"""
+        if not GEMINI_API_KEY:
+            logger.warning("⚠️ Gemini не инициализирован, пропускаем анализ")
+            return sellers, buyers
+        
+        logger.info(f"🧠 Запуск анализа Gemini для {len(sellers)} продавцов и {len(buyers)} покупателей")
+        
+        # Анализируем продавцов
+        analyzed_sellers = []
+        for seller in sellers:
+            if seller.remark and seller.remark.strip():
+                analysis = await analyze_remark_with_gemini(seller.remark, seller.merchant_name)
+                seller.third_party_ready = analysis.get("third_party_ready", True)
+                seller.third_party_analysis = analysis.get("analysis", "")
+                logger.debug(f"📊 {seller.merchant_name}: third_party={seller.third_party_ready}")
+            analyzed_sellers.append(seller)
+        
+        # Анализируем покупателей
+        analyzed_buyers = []
+        for buyer in buyers:
+            if buyer.remark and buyer.remark.strip():
+                analysis = await analyze_remark_with_gemini(buyer.remark, buyer.merchant_name)
+                buyer.third_party_ready = analysis.get("third_party_ready", True)
+                buyer.third_party_analysis = analysis.get("analysis", "")
+                logger.debug(f"📊 {buyer.merchant_name}: third_party={buyer.third_party_ready}")
+            analyzed_buyers.append(buyer)
+        
+        logger.info(f"✅ Анализ Gemini завершен")
+        return analyzed_sellers, analyzed_buyers
+    
+    def _filter_by_third_party(self, sellers: List[P2POffer], buyers: List[P2POffer], 
+                               third_party_mode: bool) -> Tuple[List[P2POffer], List[P2POffer]]:
+        """
+        Фильтрует объявления по готовности принимать платежи от 3-их лиц
+        third_party_mode=True - показываем только объявления с third_party_ready=True
+        third_party_mode=False - показываем все объявления
+        """
+        if not third_party_mode:
+            logger.info("ℹ️ Режим third_party отключен - показываем все объявления")
+            return sellers, buyers
+        
+        logger.info(f"🔍 Фильтрация по third_party (только готовые к платежам от 3-их лиц)")
+        
+        filtered_sellers = [s for s in sellers if s.third_party_ready]
+        filtered_buyers = [b for b in buyers if b.third_party_ready]
+        
+        logger.info(f"📊 Отфильтровано: продавцов {len(sellers)}->{len(filtered_sellers)}, покупателей {len(buyers)}->{len(filtered_buyers)}")
+        
+        return filtered_sellers, filtered_buyers
     
     def _find_all_arbitrage_signals(self, sellers: List[P2POffer], buyers: List[P2POffer],
                                      user_filters: Dict) -> List[ArbitrageSignal]:
@@ -534,6 +683,21 @@ class P2PArbitrageBot:
                     if not sellers or not buyers:
                         continue
                     
+                    # Анализируем объявления через Gemini
+                    sellers, buyers = await self._analyze_offers_with_gemini(sellers, buyers)
+                    
+                    # Проверяем режим third_party для пользователя
+                    third_party_mode = user_third_party_mode.get(user_id, False)
+                    
+                    # Фильтруем по third_party если нужно
+                    if third_party_mode:
+                        sellers, buyers = self._filter_by_third_party(sellers, buyers, third_party_mode)
+                    
+                    # Проверяем, что после фильтрации остались объявления
+                    if not sellers or not buyers:
+                        logger.info(f"ℹ️ Нет объявлений после фильтрации third_party для пользователя {user_id}")
+                        continue
+                    
                     signals = self._find_all_arbitrage_signals(sellers, buyers, filters)
                     
                     if signals:
@@ -599,10 +763,19 @@ class P2PArbitrageBot:
         seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
         
+        # Определяем статус third_party
+        seller_third_party = "✅ Готов" if signal.seller.third_party_ready else "❌ Не готов"
+        buyer_third_party = "✅ Готов" if signal.buyer.third_party_ready else "❌ Не готов"
+        
+        # Если есть анализ от Gemini, добавляем его
+        seller_analysis = f"\n   📝 {signal.seller.third_party_analysis}" if signal.seller.third_party_analysis else ""
+        buyer_analysis = f"\n   📝 {signal.buyer.third_party_analysis}" if signal.buyer.third_party_analysis else ""
+        
         # Логируем remark для обоих объявлений
         logger.info(f"📝 SIGNAL REMARKS for user {user_id}:")
         logger.info(f"   SELLER (merchant: {signal.seller.merchant_name}) REMARK: {signal.seller.remark}")
         logger.info(f"   BUYER (merchant: {signal.buyer.merchant_name}) REMARK: {signal.buyer.remark}")
+        logger.info(f"   SELLER third_party: {signal.seller.third_party_ready}, BUYER third_party: {signal.buyer.third_party_ready}")
         
         # Формируем сообщение
         message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
@@ -611,12 +784,14 @@ class P2PArbitrageBot:
 • Курс: {signal.seller.price:.2f}₽
 • Лимиты: {format_number(signal.seller.min_amount)} - {format_number(signal.seller.max_amount)}₽
 • Мерчант: {signal.seller.merchant_name}
+• Платежи от 3-их лиц: {seller_third_party}{seller_analysis}
 • Ссылка на профиль: {seller_profile_url}
 
 🔴 ПОКУПАТЕЛЬ (BUYER)
 • Курс: {signal.buyer.price:.2f}₽
 • Лимиты: {format_number(signal.buyer.min_amount)} - {format_number(signal.buyer.max_amount)}₽
 • Мерчант: {signal.buyer.merchant_name}
+• Платежи от 3-их лиц: {buyer_third_party}{buyer_analysis}
 • Ссылка на профиль: {buyer_profile_url}
 
 📊 РАСЧЕТ ПРИБЫЛИ
@@ -640,9 +815,10 @@ class P2PArbitrageBot:
         """Получение текущих настроек фильтров"""
         filters = user_filters.get(user_id, {})
         delay = user_signal_delay.get(user_id, 4)
+        third_party_mode = user_third_party_mode.get(user_id, False)
         
         if not filters:
-            return f"🔧 Фильтры не настроены. Используйте /help для настройки.\n\n⏱ Задержка между сигналами: {delay}с"
+            return f"🔧 Фильтры не настроены. Используйте /help для настройки.\n\n⏱ Задержка между сигналами: {delay}с\n👤 Режим 3-их лиц: {'Включен' if third_party_mode else 'Выключен'}"
         
         settings = []
         settings.append("📋 <b>Текущие настройки фильтров:</b>")
@@ -661,6 +837,7 @@ class P2PArbitrageBot:
         
         settings.append("")
         settings.append(f"⏱ <b>Задержка между сигналами:</b> {delay}с")
+        settings.append(f"👤 <b>Режим 3-их лиц:</b> {'🟢 Включен (только готовые)' if third_party_mode else '🔴 Выключен (все)'}")
         
         if len(settings) == 3:
             settings.append("⚠️ Фильтры настроены, но неактивны (запустите /start_monitoring)")
@@ -678,6 +855,8 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="stop_monitoring", description="⏹ Остановить мониторинг"),
         BotCommand(command="delay", description="⏱ Установить задержку между сигналами (сек)"),
         BotCommand(command="clear_filters", description="🧹 Очистить все фильтры"),
+        BotCommand(command="third_party_on", description="👤 Включить фильтр 3-их лиц (только готовые)"),
+        BotCommand(command="third_party_off", description="👤 Выключить фильтр 3-их лиц (все)"),
         BotCommand(command="help", description="❓ Настройка фильтров"),
     ]
     await bot.set_my_commands(commands)
@@ -707,12 +886,15 @@ async def cmd_start(message: Message):
 /stop_monitoring - Остановить мониторинг
 /delay - Установить задержку между сигналами
 /clear_filters - Очистить все фильтры
+/third_party_on - Включить фильтр 3-их лиц
+/third_party_off - Выключить фильтр 3-их лиц
 
 <b>Как это работает:</b>
 1. Настрой фильтры через /help
 2. Запусти мониторинг /start_monitoring
 3. Бот будет искать выгодные связки
 4. При найденной связке получишь сигнал со ссылками на профили
+5. В сигнале будет указано, готов ли мерчант принимать платежи от 3-их лиц
     """
     await safe_send_message(message, welcome_text)
     
@@ -721,6 +903,7 @@ async def cmd_start(message: Message):
         user_subscriptions[message.from_user.id] = False
         sent_signals[message.from_user.id] = {}
         user_signal_delay[message.from_user.id] = 4
+        user_third_party_mode[message.from_user.id] = False
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -756,7 +939,17 @@ async def cmd_help(message: Message):
    <b>⚠️ ВАЖНО:</b> Если задержка слишком маленькая (1-2с), 
    вы можете получить много сообщений подряд. Рекомендуем 3-5 секунд.
 
-5. <b>Управление</b>
+5. <b>Режим 3-их лиц (Third Party)</b>
+   /third_party_on - Включить фильтр (только объявления с готовностью к платежам от 3-их лиц)
+   /third_party_off - Выключить фильтр (все объявления)
+   
+   <b>🤖 Как работает:</b>
+   • Бот использует AI (Gemini) для анализа текста объявления (remark)
+   • Определяет, готов ли мерчант принимать платежи от 3-их лиц
+   • Если в объявлении нет явного запрета, считается, что готов
+   • В сигнале будет указан статус для продавца и покупателя
+
+6. <b>Управление</b>
    /start_monitoring - запуск поиска
    /stop_monitoring - остановка поиска
    /status - текущий статус
@@ -774,14 +967,8 @@ async def cmd_help(message: Message):
 4. /delay 5
 5. /add_blacklist "Мошенник Иван"
 6. /add_blacklist "ALL FOR ALL"
-7. /start_monitoring
-
-<b>Как работает черный список:</b>
-• Проверяет только НИК мерчанта
-• Регистр не важен
-• Можно добавить как полное имя, так и часть
-• Пример: /add_blacklist "Мошенник" - исключит всех мерчантов с этим словом в нике
-• Пример: /add_blacklist "ALL FOR ALL" - исключит только этого конкретного мерчанта
+7. /third_party_on
+8. /start_monitoring
     """
     await safe_send_message(message, help_text)
 
@@ -830,13 +1017,17 @@ async def cmd_start_monitoring(message: Message):
     
     user_subscriptions[user_id] = True
     delay = user_signal_delay.get(user_id, 4)
+    third_party_mode = user_third_party_mode.get(user_id, False)
+    
+    third_party_status = "включен (только готовые)" if third_party_mode else "выключен (все)"
     
     await safe_send_message(
         message,
         f"✅ Мониторинг запущен!\n"
         f"Бот будет присылать сигналы при нахождении выгодных связок.\n"
         f"⏱ Задержка между сигналами: {delay}с\n"
-        f"Для остановки используйте: \n/stop_monitoring"
+        f"👤 Режим 3-их лиц: {third_party_status}\n"
+        f"Для остановки используйте: /stop_monitoring"
     )
 
 @dp.message(Command("stop_monitoring"))
@@ -912,8 +1103,35 @@ async def cmd_clear_filters(message: Message):
     user_filters[user_id] = {}
     user_subscriptions[user_id] = False
     sent_signals[user_id] = {}
-    # Задержку НЕ сбрасываем, оставляем как была
-    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен. Задержка сохранена.")
+    # Задержку и режим third_party НЕ сбрасываем
+    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен. Задержка и режим 3-их лиц сохранены.")
+
+@dp.message(Command("third_party_on"))
+async def cmd_third_party_on(message: Message):
+    """Включение фильтра третьих лиц"""
+    user_id = message.from_user.id
+    user_third_party_mode[user_id] = True
+    
+    await safe_send_message(
+        message,
+        f"👤 Режим 3-их лиц ВКЛЮЧЕН!\n\n"
+        f"Теперь бот будет показывать ТОЛЬКО объявления, где мерчанты готовы принимать платежи от 3-их лиц.\n"
+        f"Если в объявлении нет явного запрета на платежи от 3-их лиц, оно будет показано.\n\n"
+        f"Для отключения используйте: /third_party_off"
+    )
+
+@dp.message(Command("third_party_off"))
+async def cmd_third_party_off(message: Message):
+    """Выключение фильтра третьих лиц"""
+    user_id = message.from_user.id
+    user_third_party_mode[user_id] = False
+    
+    await safe_send_message(
+        message,
+        f"👤 Режим 3-их лиц ВЫКЛЮЧЕН!\n\n"
+        f"Теперь бот будет показывать ВСЕ объявления, независимо от готовности к платежам от 3-их лиц.\n\n"
+        f"Для включения используйте: /third_party_on"
+    )
 
 # --- Команды для настройки фильтров ---
 
