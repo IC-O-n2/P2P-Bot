@@ -192,7 +192,7 @@ async def analyze_remark_with_gemini(remark: str, merchant_name: str) -> Dict[st
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: gemini_client.models.generate_content(
-                model='gemini-2.0-flash',
+                model='gemini-3.6-flash',
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.1,
