@@ -220,11 +220,20 @@ async def analyze_signals_batch(signals: List[Tuple[ArbitrageSignal, int]], user
         logger.warning("⚠️ Квота Gemini исчерпана, пропускаем пакетный анализ")
         return {}
     
+    # Ограничиваем количество сигналов в пакете до 3
+    signals = signals[:3]
+    
     # Формируем промпт для всех сигналов (полный remark, без обрезки!)
     prompt_parts = []
     for idx, (signal, _) in enumerate(signals):
-        seller_remark = signal.seller.remark if signal.seller.remark else ""
-        buyer_remark = signal.buyer.remark if signal.buyer.remark else ""
+        seller_remark = signal.seller.remark if signal.seller.remark else "нет текста"
+        buyer_remark = signal.buyer.remark if signal.buyer.remark else "нет текста"
+        
+        # Если текст слишком длинный - обрезаем до 500 символов для экономии токенов
+        if len(seller_remark) > 500:
+            seller_remark = seller_remark[:500] + "..."
+        if len(buyer_remark) > 500:
+            buyer_remark = buyer_remark[:500] + "..."
         
         prompt_parts.append(f"""
 СИГНАЛ #{idx + 1}:
@@ -238,19 +247,16 @@ async def analyze_signals_batch(signals: List[Tuple[ArbitrageSignal, int]], user
 Проанализируй следующие объявления и определи для КАЖДОГО, готов ли мерчант принимать платежи от ТРЕТЬИХ ЛИЦ.
 
 Правила:
-- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц", "строго 1 лицо", "первые лица" -> НЕ ГОТОВ (false)
-- Если есть "принимаю от третьих лиц", "можно от друзей", "3-и лица" -> ГОТОВ (true)
+- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц", "строго 1 лицо", "первые лица", "только свое имя" -> НЕ ГОТОВ (false)
+- Если есть "принимаю от третьих лиц", "можно от друзей", "3-и лица", "от любых лиц" -> ГОТОВ (true)
 - Если нет упоминаний о третьих лицах -> ГОТОВ (true)
 
-Верни ответ ТОЛЬКО в формате JSON:
+Верни ответ ТОЛЬКО в формате JSON (без markdown, без ```):
 {{
     "results": [
-        {{
-            "index": 1,
-            "seller_ready": true/false,
-            "buyer_ready": true/false
-        }},
-        ...
+        {{"index": 1, "seller_ready": true/false, "buyer_ready": true/false}},
+        {{"index": 2, "seller_ready": true/false, "buyer_ready": true/false}},
+        {{"index": 3, "seller_ready": true/false, "buyer_ready": true/false}}
     ]
 }}
 
@@ -269,59 +275,68 @@ async def analyze_signals_batch(signals: List[Tuple[ArbitrageSignal, int]], user
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     top_p=0.8,
-                    max_output_tokens=800,  # Увеличиваем для полных remark
+                    max_output_tokens=600,
                 )
             )
         )
         
         result_text = response.text.strip()
-        logger.info(f"📥 Получен ответ от Gemini: {result_text[:200]}...")
+        logger.info(f"📥 Получен ответ от Gemini: {result_text[:300]}...")
         
         # Увеличиваем счетчик запросов
         increment_gemini_count()
         
+        # Очищаем ответ от markdown
+        result_text = re.sub(r'```json\s*', '', result_text)
+        result_text = re.sub(r'```\s*', '', result_text)
+        result_text = result_text.strip()
+        
         # Парсим JSON
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if json_match:
-            data = json.loads(json_match.group())
-            results = data.get("results", [])
-            
-            # Сопоставляем результаты с сигналами
-            result_dict = {}
-            for res in results:
-                idx = res.get("index") - 1
-                if 0 <= idx < len(signals):
-                    signal, _ = signals[idx]
-                    signal_id = signal.signal_id
-                    
-                    # Проверяем seller и buyer
-                    seller_ready = res.get("seller_ready", True)
-                    buyer_ready = res.get("buyer_ready", True)
-                    
-                    # Если оба готовы - сигнал проходит
-                    if seller_ready and buyer_ready:
-                        result_dict[signal_id] = {
-                            "passed": True,
-                            "seller_ready": seller_ready,
-                            "buyer_ready": buyer_ready
-                        }
-                    else:
-                        result_dict[signal_id] = {
-                            "passed": False,
-                            "seller_ready": seller_ready,
-                            "buyer_ready": buyer_ready
-                        }
-                    
-                    # Сохраняем в кэш
-                    seller_cache_key = f"{signal.seller.item_id}_{signal.seller.merchant_name}"
-                    buyer_cache_key = f"{signal.buyer.item_id}_{signal.buyer.merchant_name}"
-                    gemini_cache[seller_cache_key] = {"third_party_ready": seller_ready}
-                    gemini_cache[buyer_cache_key] = {"third_party_ready": buyer_ready}
-            
-            logger.info(f"✅ Пакетный анализ завершен: {len(result_dict)} сигналов")
-            return result_dict
+            try:
+                data = json.loads(json_match.group())
+                results = data.get("results", [])
+                
+                # Сопоставляем результаты с сигналами
+                result_dict = {}
+                for res in results:
+                    idx = res.get("index") - 1
+                    if 0 <= idx < len(signals):
+                        signal, _ = signals[idx]
+                        signal_id = signal.signal_id
+                        
+                        seller_ready = res.get("seller_ready", True)
+                        buyer_ready = res.get("buyer_ready", True)
+                        
+                        if seller_ready and buyer_ready:
+                            result_dict[signal_id] = {
+                                "passed": True,
+                                "seller_ready": seller_ready,
+                                "buyer_ready": buyer_ready
+                            }
+                        else:
+                            result_dict[signal_id] = {
+                                "passed": False,
+                                "seller_ready": seller_ready,
+                                "buyer_ready": buyer_ready
+                            }
+                        
+                        # Сохраняем в кэш
+                        seller_cache_key = f"{signal.seller.item_id}_{signal.seller.merchant_name}"
+                        buyer_cache_key = f"{signal.buyer.item_id}_{signal.buyer.merchant_name}"
+                        gemini_cache[seller_cache_key] = {"third_party_ready": seller_ready}
+                        gemini_cache[buyer_cache_key] = {"third_party_ready": buyer_ready}
+                
+                logger.info(f"✅ Пакетный анализ завершен: {len(result_dict)} сигналов")
+                return result_dict
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Ошибка парсинга JSON: {e}")
+                logger.error(f"Текст ответа: {result_text}")
+                return {}
         else:
-            logger.warning(f"⚠️ Не удалось распарсить ответ Gemini: {result_text[:200]}")
+            logger.warning(f"⚠️ Не найден JSON в ответе Gemini")
+            logger.warning(f"Текст ответа: {result_text[:500]}")
             return {}
             
     except Exception as e:
@@ -521,7 +536,7 @@ class P2PArbitrageBot:
         return f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item"
     
     def _find_best_signals(self, sellers: List[P2POffer], buyers: List[P2POffer],
-                           filters: Dict, max_signals: int = 10) -> List[ArbitrageSignal]:
+                           filters: Dict, max_signals: int = 5) -> List[ArbitrageSignal]:
         """Находит лучшие сигналы без проверки Gemini"""
         if not sellers or not buyers:
             return []
@@ -598,7 +613,7 @@ class P2PArbitrageBot:
         
         # Проверяем, нужно ли пополнять очередь
         queue = user_verified_signals_queue.get(user_id, deque())
-        if len(queue) >= 3:
+        if len(queue) >= 2:
             logger.info(f"📦 В очереди {len(queue)} сигналов, пополнение не требуется")
             return
         
@@ -619,7 +634,7 @@ class P2PArbitrageBot:
         
         # Если Gemini выключен - просто добавляем сигналы без проверки
         if not gemini_enabled or not gemini_client:
-            signals = self._find_best_signals(sellers, buyers, filters, max_signals=5)
+            signals = self._find_best_signals(sellers, buyers, filters, max_signals=3)
             
             if signals:
                 queue = user_verified_signals_queue.get(user_id, deque())
@@ -634,8 +649,8 @@ class P2PArbitrageBot:
         user_analysis_in_progress[user_id] = True
         
         try:
-            # Находим топ-5 потенциальных сигналов
-            candidates = self._find_best_signals(sellers, buyers, filters, max_signals=5)
+            # Находим топ-3 потенциальных сигналов
+            candidates = self._find_best_signals(sellers, buyers, filters, max_signals=3)
             
             if not candidates:
                 logger.info(f"ℹ️ Нет потенциальных сигналов для пользователя {user_id}")
@@ -757,9 +772,7 @@ class P2PArbitrageBot:
         
         logger.info(f"📝 SIGNAL for user {user_id}:")
         logger.info(f"   SELLER: {signal.seller.merchant_name}")
-        logger.info(f"   REMARK: {signal.seller.remark[:200]}..." if signal.seller.remark and len(signal.seller.remark) > 200 else f"   REMARK: {signal.seller.remark}")
         logger.info(f"   BUYER: {signal.buyer.merchant_name}")
-        logger.info(f"   REMARK: {signal.buyer.remark[:200]}..." if signal.buyer.remark and len(signal.buyer.remark) > 200 else f"   REMARK: {signal.buyer.remark}")
         
         seller_third_party = "✅ Готов к платежам от 3-их лиц" if signal.seller.third_party_ready else "❌ Не готов к платежам от 3-их лиц"
         buyer_third_party = "✅ Готов к платежам от 3-их лиц" if signal.buyer.third_party_ready else "❌ Не готов к платежам от 3-их лиц"
@@ -883,7 +896,7 @@ async def cmd_start(message: Message):
 /gemini_off - Выключить анализ 3-их лиц
 
 <b>⚡ Оптимизация квоты Gemini:</b>
-• Пакетный анализ: 1 запрос = 3-5 сигналов
+• Пакетный анализ: 1 запрос = 2-3 сигнала
 • Кэширование результатов
 • Очередь проверенных сигналов
 • Экономия квоты до 80%
@@ -930,7 +943,7 @@ async def cmd_help(message: Message):
    /gemini_off - Выключить проверку 3-их лиц
 
 <b>⚡ Оптимизация:</b>
-• 1 запрос = 3-5 сигналов
+• 1 запрос = 2-3 сигнала
 • Кэширование результатов
 • Очередь проверенных сигналов
 • Экономия квоты до 80%
@@ -982,7 +995,7 @@ async def cmd_start_monitoring(message: Message):
         f"✅ Мониторинг запущен!\n"
         f"⏱ Задержка: {delay}с\n"
         f"🤖 Gemini: {'Включен' if gemini_enabled else 'Выключен'}\n"
-        f"⚡ 1 запрос Gemini = 3-5 сигналов"
+        f"⚡ 1 запрос Gemini = 2-3 сигнала"
     )
 
 @dp.message(Command("stop_monitoring"))
@@ -1041,7 +1054,7 @@ async def cmd_gemini_on(message: Message):
         message,
         "🤖 Gemini ВКЛЮЧЕН!\n\n"
         "Теперь бот будет проверять готовность к 3-им лицам.\n"
-        "⚡ Пакетный режим: 1 запрос = 3-5 сигналов\n"
+        "⚡ Пакетный режим: 1 запрос = 2-3 сигнала\n"
         "📦 Результаты кэшируются\n"
         "📊 Экономия квоты до 80%"
     )
