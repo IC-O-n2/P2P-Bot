@@ -172,19 +172,35 @@ async def analyze_single_with_gemini(remark: str, merchant_name: str, item_id: s
     await wait_for_gemini_quota()
     
     prompt = f"""
-Анализ объявления от {merchant_name}:
-Текст: "{remark}"
+Твоя задача — проанализировать текст объявления и определить, готов ли мерчант принимать платежи от ТРЕТЬИХ ЛИЦ.
 
-Готов ли мерчант принимать платежи от ТРЕТЬИХ ЛИЦ?
-(Третьи лица - платеж совершает не покупатель, а другое лицо)
+Третьи лица — это ситуация, когда платеж совершает не сам покупатель, а другое лицо (друг, родственник, клиент и т.д.).
 
-Правила:
-- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц", "ТОЛЬКО 1 ЛИЦА", "СТРОГО 1 Лица", "от первого лица", "только первые лица" -> НЕ ГОТОВ
-- Если есть "принимаю от третьих лиц", "можно от друзей" -> ГОТОВ
-- Если есть "ЛК на руках" - это НЕ значит готовность к 3-им лицам
-- Если нет упоминаний о 3-их лицах -> ГОТОВ (по умолчанию)
+Важно: в тексте могут быть опечатки, грамматические ошибки, разные варианты написания. Твоя задача — понять СМЫСЛ написанного, а не искать точные совпадения.
 
-Верни ТОЛЬКО: true (если готов) или false (если не готов)
+Текст объявления от {merchant_name}:
+"{remark}"
+
+Правила определения:
+1. НЕ ГОТОВ к 3-им лицам, если есть любой из этих смыслов:
+   - "только от себя", "только свои карты", "только личная карта"
+   - "не принимаю от третьих лиц", "запрет на третьих лиц", "без 3-их лиц"
+   - "только 1 лица", "строго 1 лица", "только первые лица", "только первое лицо"
+   - "только от 1 лица", "только 1 лицо" (включая опечатки типа "лаца" вместо "лица")
+   - "оплата личной картой (от первого лица)"
+   - "не работаю с треугольниками", "без треугольников"
+
+2. ГОТОВ к 3-им лицам, если есть любой из этих смыслов:
+   - "принимаю от третьих лиц", "можно от друзей", "можно от 3-их лиц"
+   - "принимаю от 3 лиц", "от 3-х лиц принимаю"
+
+3. Если в тексте НЕТ упоминаний о 3-их лицах, первых лицах, запретах или разрешениях — считается ГОТОВ (по умолчанию).
+
+4. Если есть "ЛК на руках" или "доступ к ЛК" — это НЕ означает готовность к 3-им лицам, это просто требование к покупателю.
+
+Верни ТОЛЬКО: true (если готов принимать от третьих лиц) или false (если не готов)
+
+Не пиши ничего кроме true или false. Только один ответ.
 """
     
     try:
@@ -193,7 +209,7 @@ async def analyze_single_with_gemini(remark: str, merchant_name: str, item_id: s
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: gemini_client.models.generate_content(
-                model='gemini-3.5-flash-lite',
+                model='gemini-2.0-flash-lite',
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.0,
@@ -213,6 +229,8 @@ async def analyze_single_with_gemini(remark: str, merchant_name: str, item_id: s
         elif "false" in result_text:
             ready = False
         else:
+            # Если не поняли ответ - считаем готовым
+            logger.warning(f"⚠️ Непонятный ответ Gemini для {merchant_name}: {result_text}, считаем готовым")
             ready = True
         
         result = {"ready": ready, "analyzed": True}
@@ -221,7 +239,7 @@ async def analyze_single_with_gemini(remark: str, merchant_name: str, item_id: s
         gemini_cache_ttl[cache_key] = datetime.now()
         
         logger.info(f"✅ Gemini анализ для {merchant_name}: готов={ready}")
-        logger.info(f"📝 REMARK: {remark[:200]}...")
+        logger.info(f"📝 REMARK: {remark[:300]}...")
         
         return result
         
@@ -507,7 +525,7 @@ class P2PArbitrageBot:
         potential_sellers.sort(key=lambda x: x.price)
         potential_buyers.sort(key=lambda x: x.price, reverse=True)
         
-        # Берем топ-15 для анализа (увеличил для большего покрытия)
+        # Берем топ-15 для анализа
         top_sellers = potential_sellers[:15]
         top_buyers = potential_buyers[:15]
         
@@ -570,7 +588,7 @@ class P2PArbitrageBot:
             if analyzed_count < len(offers_to_analyze):
                 await asyncio.sleep(0.8)
         
-        # Важно: для всех остальных объявлений (не проанализированных) -
+        # Для всех остальных объявлений (не проанализированных) -
         # помечаем как НЕ ПРОАНАЛИЗИРОВАННЫЕ и НЕ ГОТОВЫЕ (будут исключены из сигналов)
         for seller in sellers:
             if seller not in top_sellers:
