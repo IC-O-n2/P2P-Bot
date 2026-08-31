@@ -144,14 +144,14 @@ async def safe_send_message(message: Message, text: str):
         logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
         await message.answer(text.replace('<', '[').replace('>', ']'))
 
-# Функция анализа remark через Gemini
+# Функция анализа remark через Gemini (улучшенный промпт)
 async def analyze_with_gemini(remark: str, merchant_name: str, item_id: str) -> Dict[str, any]:
     """
     Анализирует remark через Gemini для определения готовности к платежам от 3-их лиц.
     Использует кэш для повторных запросов.
     """
     if not gemini_client:
-        return {"third_party_ready": True, "analysis": "Gemini не доступен"}
+        return {"third_party_ready": True}
     
     # Кэш
     cache_key = f"{item_id}_{merchant_name}"
@@ -160,25 +160,44 @@ async def analyze_with_gemini(remark: str, merchant_name: str, item_id: str) -> 
         return gemini_cache[cache_key]
     
     if not remark or not remark.strip():
-        result = {"third_party_ready": True, "analysis": ""}
+        result = {"third_party_ready": True}
         gemini_cache[cache_key] = result
         return result
     
     try:
+        # Улучшенный промпт с примерами
         prompt = f"""
-Анализ объявления от {merchant_name}:
-Текст: "{remark}"
+Ты анализируешь текст объявления (remark) от мерчанта {merchant_name} на P2P платформе Bybit.
+Текст объявления: "{remark}"
 
-Готов ли мерчант принимать платежи от ТРЕТЬИХ ЛИЦ?
-(Третьи лица - платеж совершает не покупатель, а другое лицо)
+Твоя задача: определить, готов ли этот мерчант принимать платежи от ТРЕТЬИХ ЛИЦ.
+Третьи лица - это когда платеж за USDT совершает не сам покупатель, а другое лицо (друг, родственник, коллега).
 
-Правила:
-- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц" -> НЕ ГОТОВ
-- Если есть "принимаю от третьих лиц", "можно от друзей" -> ГОТОВ
-- Если нет упоминаний -> ГОТОВ (по умолчанию)
+ПРИМЕРЫ, КОГДА НЕ ГОТОВ (third_party_ready = false):
+- "Платежи только с карты, оформленной на ваше имя"
+- "Только переводы от своего имени, без третьих лиц"
+- "Не принимаю платежи от третьих лиц"
+- "Только свои карты, без перевыпуска"
+- "Запрещены переводы от друзей и родственников"
 
-Верни JSON: {{"ready": true/false, "comment": "краткий комментарий"}}
+ПРИМЕРЫ, КОГДА ГОТОВ (third_party_ready = true):
+- "Принимаю платежи от третьих лиц"
+- "Можно переводить с карт друзей и родственников"
+- "Платежи от третьих лиц разрешены"
+- "Допускаются переводы от любых лиц"
+- В тексте НЕТ упоминаний о запрете третьих лиц
+
+ПРАВИЛО: Если в тексте НЕТ явного запрета на платежи от третьих лиц, считай, что мерчант ГОТОВ (true).
+
+Верни ответ ТОЛЬКО в формате JSON:
+{{"third_party_ready": true/false}}
+
+Никаких других слов, только JSON!
 """
+        
+        # Логируем запрос
+        logger.info(f"📤 Запрос к Gemini для {merchant_name}")
+        logger.info(f"📝 Текст для анализа: {remark[:200]}...")
         
         response = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -188,39 +207,43 @@ async def analyze_with_gemini(remark: str, merchant_name: str, item_id: str) -> 
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     top_p=0.8,
-                    max_output_tokens=150,
+                    max_output_tokens=50,  # Минимум токенов
                 )
             )
         )
         
         result_text = response.text.strip()
+        logger.info(f"📥 Ответ Gemini для {merchant_name}: {result_text}")
         
         # Парсим JSON
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
-            ready = data.get("ready")
+            ready = data.get("third_party_ready")
             if ready is None:
-                ready = True
-            result = {
-                "third_party_ready": bool(ready),
-                "analysis": data.get("comment", "")
-            }
+                ready = data.get("ready")
+            if ready is None:
+                ready = True  # По умолчанию готов
+            
+            result = {"third_party_ready": bool(ready)}
+            gemini_cache[cache_key] = result
+            logger.info(f"✅ Gemini анализ для {merchant_name}: third_party_ready={result['third_party_ready']}")
+            return result
         else:
-            # Определяем по тексту
+            # Если JSON не найден, определяем по тексту
             lower_text = result_text.lower()
-            if "не готов" in lower_text or "not ready" in lower_text:
-                result = {"third_party_ready": False, "analysis": "Не готов"}
+            if "false" in lower_text or "не готов" in lower_text or "not ready" in lower_text:
+                result = {"third_party_ready": False}
             else:
-                result = {"third_party_ready": True, "analysis": ""}
-        
-        gemini_cache[cache_key] = result
-        logger.info(f"✅ Gemini анализ для {merchant_name}: ready={result['third_party_ready']}")
-        return result
+                result = {"third_party_ready": True}
+            
+            gemini_cache[cache_key] = result
+            logger.info(f"✅ Gemini анализ для {merchant_name} (по тексту): third_party_ready={result['third_party_ready']}")
+            return result
         
     except Exception as e:
         logger.error(f"❌ Ошибка Gemini для {merchant_name}: {e}")
-        result = {"third_party_ready": True, "analysis": ""}
+        result = {"third_party_ready": True}  # В случае ошибки считаем готовым
         gemini_cache[cache_key] = result
         return result
 
@@ -241,7 +264,6 @@ class P2POffer:
     user_mask_id: str
     remark: str = ""
     third_party_ready: bool = True
-    third_party_analysis: str = ""
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -370,8 +392,7 @@ class BybitP2PClient:
                     user_id=user_id,
                     user_mask_id=user_mask_id,
                     remark=remark,
-                    third_party_ready=True,
-                    third_party_analysis=""
+                    third_party_ready=True
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
@@ -494,10 +515,8 @@ class P2PArbitrageBot:
             # Если Gemini выключен - просто помечаем все как готовые
             for seller in sellers:
                 seller.third_party_ready = True
-                seller.third_party_analysis = ""
             for buyer in buyers:
                 buyer.third_party_ready = True
-                buyer.third_party_analysis = ""
             return sellers, buyers
         
         # Анализируем объявления с remark (только топ-10 для экономии)
@@ -521,20 +540,16 @@ class P2PArbitrageBot:
             cache_key = f"{seller.item_id}_{seller.merchant_name}"
             if cache_key in gemini_cache:
                 seller.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                seller.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
             else:
                 # Если не анализировали - считаем готовым
                 seller.third_party_ready = True
-                seller.third_party_analysis = ""
         
         for buyer in buyers:
             cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
             if cache_key in gemini_cache:
                 buyer.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                buyer.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
             else:
                 buyer.third_party_ready = True
-                buyer.third_party_analysis = ""
         
         return sellers, buyers
     
@@ -778,34 +793,34 @@ class P2PArbitrageBot:
         seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
         
-        # Логируем remark для обоих объявлений
+        # Логируем remark и результат Gemini для обоих объявлений
         logger.info(f"📝 SIGNAL REMARKS for user {user_id}:")
-        logger.info(f"   SELLER (merchant: {signal.seller.merchant_name}) REMARK: {signal.seller.remark}")
-        logger.info(f"   BUYER (merchant: {signal.buyer.merchant_name}) REMARK: {signal.buyer.remark}")
+        logger.info(f"   SELLER: {signal.seller.merchant_name}")
+        logger.info(f"   REMARK: {signal.seller.remark}")
+        logger.info(f"   Gemini ответ: third_party_ready={signal.seller.third_party_ready}")
+        logger.info(f"   BUYER: {signal.buyer.merchant_name}")
+        logger.info(f"   REMARK: {signal.buyer.remark}")
+        logger.info(f"   Gemini ответ: third_party_ready={signal.buyer.third_party_ready}")
         
-        # Определяем статус third_party
-        seller_third_party = "✅ Готов" if signal.seller.third_party_ready else "❌ Не готов"
-        buyer_third_party = "✅ Готов" if signal.buyer.third_party_ready else "❌ Не готов"
+        # Определяем статус third_party (новая формулировка)
+        seller_third_party = "✅ Готов к платежам от 3-их лиц" if signal.seller.third_party_ready else "❌ Не готов к платежам от 3-их лиц"
+        buyer_third_party = "✅ Готов к платежам от 3-их лиц" if signal.buyer.third_party_ready else "❌ Не готов к платежам от 3-их лиц"
         
-        # Добавляем комментарий только если он есть и осмысленный
-        seller_comment = f"\n   📝 {signal.seller.third_party_analysis}" if signal.seller.third_party_analysis and signal.seller.third_party_analysis not in ["", "Нет данных для анализа", "Ошибка парсинга"] else ""
-        buyer_comment = f"\n   📝 {signal.buyer.third_party_analysis}" if signal.buyer.third_party_analysis and signal.buyer.third_party_analysis not in ["", "Нет данных для анализа", "Ошибка парсинга"] else ""
-        
-        # Формируем сообщение
+        # Формируем сообщение (без комментариев от Gemini)
         message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
 
 🟢 ПРОДАВЕЦ (SELLER)
 • Курс: {signal.seller.price:.2f}₽
 • Лимиты: {format_number(signal.seller.min_amount)} - {format_number(signal.seller.max_amount)}₽
 • Мерчант: {signal.seller.merchant_name}
-• Платежи от 3-их лиц: {seller_third_party}{seller_comment}
+• {seller_third_party}
 • Ссылка на профиль: {seller_profile_url}
 
 🔴 ПОКУПАТЕЛЬ (BUYER)
 • Курс: {signal.buyer.price:.2f}₽
 • Лимиты: {format_number(signal.buyer.min_amount)} - {format_number(signal.buyer.max_amount)}₽
 • Мерчант: {signal.buyer.merchant_name}
-• Платежи от 3-их лиц: {buyer_third_party}{buyer_comment}
+• {buyer_third_party}
 • Ссылка на профиль: {buyer_profile_url}
 
 📊 РАСЧЕТ ПРИБЫЛИ
