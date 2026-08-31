@@ -73,12 +73,6 @@ gemini_cache: Dict[str, Dict[str, any]] = {}
 gemini_cache_ttl: Dict[str, datetime] = {}  # Время истечения кэша
 CACHE_TTL_MINUTES = 30  # Кэш живет 30 минут
 
-# Токен-батчинг для Gemini
-gemini_batch: Dict[str, List[Dict]] = {}  # Группировка запросов по мерчанту
-BATCH_SIZE = 5  # Максимум 5 запросов в одном батче
-BATCH_INTERVAL = 30  # Интервал между батчами в секундах
-last_batch_time: Dict[str, datetime] = {}  # Время последнего батча для каждого мерчанта
-
 # Вспомогательная функция для парсинга аргументов с поддержкой кавычек
 def parse_args_with_quotes(text: str) -> List[str]:
     """
@@ -174,14 +168,21 @@ async def analyze_batch_with_gemini(offers: List[Tuple[str, str, str]]) -> Dict[
 Третьи лица - платеж совершает не покупатель, а другое лицо.
 
 Правила для каждого объявления:
-- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц" -> НЕ ГОТОВ
+- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц", "ТОЛЬКО 1 ЛИЦА", "СТРОГО 1 Лица", "от первого лица" -> НЕ ГОТОВ
 - Если есть "принимаю от третьих лиц", "можно от друзей" -> ГОТОВ
-- Если нет упоминаний -> ГОТОВ (по умолчанию)
+- Если нет упоминаний или есть "от 3-х лиц не принимаю" -> НЕ ГОТОВ
+- Если есть "ЛК на руках" - это НЕ значит готовность к 3-им лицам
 
-{offers_text}
+Верни ТОЛЬКО JSON-массив с результатами для каждого объявления в том же порядке.
+Используй числовые id (1, 2, 3...) в том же порядке, как в запросе.
 
-Верни JSON-массив с результатами для каждого объявления в том же порядке:
-[{{"id": "item_id_1", "ready": true/false, "comment": "краткий комментарий"}}, ...]
+Пример ответа:
+[
+  {{"id": 1, "ready": false, "comment": "Указано 'ТОЛЬКО 1 ЛИЦА'"}},
+  {{"id": 2, "ready": true, "comment": "Нет запретов"}}
+]
+
+ВЕРНИ ТОЛЬКО JSON, БЕЗ ДРУГОГО ТЕКСТА!
 """
     
     try:
@@ -195,29 +196,58 @@ async def analyze_batch_with_gemini(offers: List[Tuple[str, str, str]]) -> Dict[
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     top_p=0.8,
-                    max_output_tokens=500,
+                    max_output_tokens=800,
                 )
             )
         )
         
         result_text = response.text.strip()
-        logger.info(f"📥 Ответ Gemini (батч): {result_text[:200]}...")
+        logger.info(f"📥 Ответ Gemini (батч): {result_text[:500]}...")
+        
+        # Удаляем маркеры кода если есть
+        result_text = re.sub(r'```json\s*', '', result_text)
+        result_text = re.sub(r'```\s*', '', result_text)
+        result_text = result_text.strip()
         
         # Парсим JSON
-        json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group())
+        try:
+            data = json.loads(result_text)
             results = {}
-            for item in data:
-                item_id = item.get("id")
-                if item_id:
-                    results[item_id] = {
-                        "third_party_ready": item.get("ready", True),
-                        "analysis": item.get("comment", "")
-                    }
-            return results
-        else:
-            logger.warning(f"Не удалось распарсить JSON из ответа Gemini: {result_text[:100]}")
+            if isinstance(data, list):
+                for item in data:
+                    # Поддерживаем как числовые, так и строковые id
+                    item_id = item.get("id")
+                    if item_id is not None:
+                        # Преобразуем в строку для единообразия
+                        item_id_str = str(item_id)
+                        results[item_id_str] = {
+                            "third_party_ready": item.get("ready", True),
+                            "analysis": item.get("comment", "")
+                        }
+                return results
+            else:
+                logger.warning(f"Ожидался массив, получено: {type(data)}")
+                return {}
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка парсинга JSON: {e}")
+            # Пробуем извлечь JSON из текста
+            json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
+            if json_match:
+                try:
+                    data = json.loads(json_match.group())
+                    results = {}
+                    if isinstance(data, list):
+                        for item in data:
+                            item_id = item.get("id")
+                            if item_id is not None:
+                                item_id_str = str(item_id)
+                                results[item_id_str] = {
+                                    "third_party_ready": item.get("ready", True),
+                                    "analysis": item.get("comment", "")
+                                }
+                        return results
+                except:
+                    pass
             return {}
             
     except Exception as e:
@@ -246,92 +276,8 @@ async def analyze_with_gemini(remark: str, merchant_name: str, item_id: str, use
         gemini_cache_ttl[cache_key] = datetime.now()
         return result
     
-    # Добавляем в батч для групповой обработки
-    if item_id not in gemini_batch:
-        gemini_batch[item_id] = []
-    
-    gemini_batch[item_id].append({
-        "item_id": item_id,
-        "merchant_name": merchant_name,
-        "remark": remark,
-        "cache_key": cache_key
-    })
-    
-    # Если батч достиг размера BATCH_SIZE или прошло достаточно времени - отправляем
-    if len(gemini_batch[item_id]) >= BATCH_SIZE:
-        return await _process_batch(item_id)
-    
-    # Иначе ждем накопления или таймаута
-    return {"third_party_ready": True, "analysis": "В обработке..."}
-
-async def _process_batch(item_id: str) -> Dict[str, any]:
-    """Обрабатывает накопленный батч запросов для одного мерчанта"""
-    if item_id not in gemini_batch or not gemini_batch[item_id]:
-        return {}
-    
-    # Проверяем, не был ли батч уже обработан
-    last_time = last_batch_time.get(item_id)
-    if last_time and (datetime.now() - last_time).seconds < BATCH_INTERVAL:
-        # Если прошло мало времени, не отправляем
-        return {}
-    
-    batch = gemini_batch[item_id]
-    gemini_batch[item_id] = []  # Очищаем батч
-    
-    # Подготавливаем данные для батч-запроса
-    offers = [(item["item_id"], item["merchant_name"], item["remark"]) for item in batch]
-    
-    # Отправляем батч-запрос
-    results = await analyze_batch_with_gemini(offers)
-    
-    # Сохраняем результаты в кэш
-    for item in batch:
-        cache_key = item["cache_key"]
-        if item["item_id"] in results:
-            result = results[item["item_id"]]
-            gemini_cache[cache_key] = result
-            gemini_cache_ttl[cache_key] = datetime.now()
-            logger.info(f"✅ Gemini анализ для {item['merchant_name']}: ready={result['third_party_ready']}")
-            logger.info(f"📝 REMARK: {item['remark'][:200]}...")
-            logger.info(f"📝 Ответ: {result}")
-        else:
-            # Если не получили результат, используем дефолтный
-            default_result = {"third_party_ready": True, "analysis": ""}
-            gemini_cache[cache_key] = default_result
-            gemini_cache_ttl[cache_key] = datetime.now()
-    
-    last_batch_time[item_id] = datetime.now()
-    return {}
-
-# Периодическая очистка кэша
-async def clean_gemini_cache():
-    """Очищает старые записи из кэша Gemini"""
-    while True:
-        try:
-            now = datetime.now()
-            expired_keys = []
-            for key, cache_time in gemini_cache_ttl.items():
-                if now - cache_time > timedelta(minutes=CACHE_TTL_MINUTES):
-                    expired_keys.append(key)
-            
-            for key in expired_keys:
-                if key in gemini_cache:
-                    del gemini_cache[key]
-                if key in gemini_cache_ttl:
-                    del gemini_cache_ttl[key]
-            
-            if expired_keys:
-                logger.info(f"🧹 Очищено {len(expired_keys)} устаревших записей из кэша Gemini")
-            
-            # Также очищаем пустые батчи
-            empty_items = [k for k, v in gemini_batch.items() if not v]
-            for k in empty_items:
-                del gemini_batch[k]
-            
-            await asyncio.sleep(300)  # Проверяем каждые 5 минут
-        except Exception as e:
-            logger.error(f"Ошибка очистки кэша Gemini: {e}")
-            await asyncio.sleep(300)
+    # Возвращаем дефолтное значение (будет проанализировано позже в батче)
+    return {"third_party_ready": True, "analysis": "Ожидает анализа"}
 
 @dataclass
 class P2POffer:
@@ -499,7 +445,6 @@ class P2PArbitrageBot:
         self.monitor_task: Optional[asyncio.Task] = None
         self.bybit_client = None
         self._stop_requested = False  # Флаг для экстренной остановки
-        self._gemini_batch_task: Optional[asyncio.Task] = None  # Задача для периодической обработки батчей
         
         if BYBIT_API_KEY and BYBIT_API_SECRET:
             self.bybit_client = BybitP2PClient(BYBIT_API_KEY, BYBIT_API_SECRET)
@@ -512,32 +457,18 @@ class P2PArbitrageBot:
         self.is_running = True
         self._stop_requested = False
         self.monitor_task = asyncio.create_task(self._monitor_loop())
-        
-        # Запускаем задачу очистки кэша Gemini
-        if gemini_client:
-            self._gemini_batch_task = asyncio.create_task(clean_gemini_cache())
-        
         logger.info("Бот успешно запущен")
         
     async def stop(self):
         """Остановка бота"""
         self.is_running = False
         self._stop_requested = True
-        
         if self.monitor_task:
             self.monitor_task.cancel()
             try:
                 await self.monitor_task
             except asyncio.CancelledError:
                 pass
-        
-        if self._gemini_batch_task:
-            self._gemini_batch_task.cancel()
-            try:
-                await self._gemini_batch_task
-            except asyncio.CancelledError:
-                pass
-        
         logger.info("Бот остановлен")
     
     async def stop_for_user(self, user_id: int):
@@ -626,16 +557,38 @@ class P2PArbitrageBot:
         
         # Собираем все объявления с remark для анализа
         all_offers = []
+        offer_map = {}  # Для быстрого поиска по item_id
         
         # Добавляем продавцов
         for seller in sellers:
             if seller.remark and seller.remark.strip():
-                all_offers.append((seller.item_id, seller.merchant_name, seller.remark, seller))
+                # Проверяем кэш
+                cache_key = f"{seller.item_id}_{seller.merchant_name}"
+                if cache_key in gemini_cache:
+                    cache_time = gemini_cache_ttl.get(cache_key)
+                    if cache_time and datetime.now() - cache_time < timedelta(minutes=CACHE_TTL_MINUTES):
+                        # Используем кэш
+                        seller.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
+                        seller.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
+                        continue
+                
+                # Добавляем для анализа
+                all_offers.append((seller.item_id, seller.merchant_name, seller.remark))
+                offer_map[seller.item_id] = seller
         
         # Добавляем покупателей
         for buyer in buyers:
             if buyer.remark and buyer.remark.strip():
-                all_offers.append((buyer.item_id, buyer.merchant_name, buyer.remark, buyer))
+                cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
+                if cache_key in gemini_cache:
+                    cache_time = gemini_cache_ttl.get(cache_key)
+                    if cache_time and datetime.now() - cache_time < timedelta(minutes=CACHE_TTL_MINUTES):
+                        buyer.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
+                        buyer.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
+                        continue
+                
+                all_offers.append((buyer.item_id, buyer.merchant_name, buyer.remark))
+                offer_map[buyer.item_id] = buyer
         
         if not all_offers:
             # Нет объявлений с remark
@@ -647,76 +600,74 @@ class P2PArbitrageBot:
                 buyer.third_party_analysis = ""
             return sellers, buyers
         
-        # Группируем объявления по item_id для батчинга
-        # Проверяем кэш для каждого объявления
-        offers_to_analyze = []
-        cached_results = {}
+        # Разбиваем на батчи по 5
+        BATCH_SIZE = 5
+        batch_results = {}
         
-        for item_id, merchant_name, remark, offer in all_offers:
-            cache_key = f"{item_id}_{merchant_name}"
-            if cache_key in gemini_cache:
-                # Проверяем TTL
-                cache_time = gemini_cache_ttl.get(cache_key)
-                if cache_time and datetime.now() - cache_time < timedelta(minutes=CACHE_TTL_MINUTES):
-                    cached_results[cache_key] = gemini_cache[cache_key]
-                    continue
+        for i in range(0, len(all_offers), BATCH_SIZE):
+            batch = all_offers[i:i+BATCH_SIZE]
             
-            # Добавляем в батч для анализа
-            offers_to_analyze.append((item_id, merchant_name, remark))
-        
-        # Анализируем только те, которых нет в кэше
-        if offers_to_analyze:
-            # Разбиваем на батчи по BATCH_SIZE
-            for i in range(0, len(offers_to_analyze), BATCH_SIZE):
-                batch = offers_to_analyze[i:i+BATCH_SIZE]
-                batch_results = await analyze_batch_with_gemini(batch)
-                
-                # Сохраняем результаты в кэш
-                for item_id, merchant_name, remark in batch:
+            # Отправляем батч в Gemini
+            results = await analyze_batch_with_gemini(batch)
+            
+            # Сохраняем результаты
+            for idx, (item_id, merchant_name, remark) in enumerate(batch, 1):
+                # Пробуем найти результат по индексу (1-based)
+                idx_str = str(idx)
+                if idx_str in results:
+                    result = results[idx_str]
                     cache_key = f"{item_id}_{merchant_name}"
-                    if item_id in batch_results:
-                        result = batch_results[item_id]
+                    gemini_cache[cache_key] = result
+                    gemini_cache_ttl[cache_key] = datetime.now()
+                    batch_results[item_id] = result
+                    logger.info(f"✅ Gemini анализ для {merchant_name} (ID: {item_id}): ready={result['third_party_ready']}")
+                    logger.info(f"📝 REMARK: {remark}")
+                    logger.info(f"📝 Ответ: {result}")
+                else:
+                    # Ищем по item_id
+                    if item_id in results:
+                        result = results[item_id]
+                        cache_key = f"{item_id}_{merchant_name}"
                         gemini_cache[cache_key] = result
                         gemini_cache_ttl[cache_key] = datetime.now()
-                        logger.info(f"✅ Gemini анализ для {merchant_name}: ready={result['third_party_ready']}")
+                        batch_results[item_id] = result
+                        logger.info(f"✅ Gemini анализ для {merchant_name} (ID: {item_id}): ready={result['third_party_ready']}")
                         logger.info(f"📝 REMARK: {remark}")
                         logger.info(f"📝 Ответ: {result}")
-                        cached_results[cache_key] = result
                     else:
-                        # Если не получили результат, используем дефолтный
+                        # Не нашли результат - используем дефолтный
                         default_result = {"third_party_ready": True, "analysis": ""}
+                        cache_key = f"{item_id}_{merchant_name}"
                         gemini_cache[cache_key] = default_result
                         gemini_cache_ttl[cache_key] = datetime.now()
-                        cached_results[cache_key] = default_result
-                
-                # Задержка между батчами, чтобы не превысить лимиты (15 запросов в минуту)
-                if i + BATCH_SIZE < len(offers_to_analyze):
-                    await asyncio.sleep(4)  # 4 секунды между батчами
+                        batch_results[item_id] = default_result
+                        logger.warning(f"⚠️ Нет результата для {merchant_name} (ID: {item_id}), используем дефолтный")
+            
+            # Задержка между батчами
+            if i + BATCH_SIZE < len(all_offers):
+                await asyncio.sleep(3)
         
         # Применяем результаты ко всем объявлениям
         for seller in sellers:
-            cache_key = f"{seller.item_id}_{seller.merchant_name}"
-            if cache_key in cached_results:
-                seller.third_party_ready = cached_results[cache_key].get("third_party_ready", True)
-                seller.third_party_analysis = cached_results[cache_key].get("analysis", "")
-            elif cache_key in gemini_cache:
-                seller.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                seller.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
-            else:
-                seller.third_party_ready = True
-                seller.third_party_analysis = ""
+            if seller.item_id in batch_results:
+                seller.third_party_ready = batch_results[seller.item_id].get("third_party_ready", True)
+                seller.third_party_analysis = batch_results[seller.item_id].get("analysis", "")
+            elif seller.item_id in offer_map:
+                # Если есть в offer_map, но нет в результатах - используем кэш
+                cache_key = f"{seller.item_id}_{seller.merchant_name}"
+                if cache_key in gemini_cache:
+                    seller.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
+                    seller.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
         
         for buyer in buyers:
-            cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
-            if cache_key in cached_results:
-                buyer.third_party_ready = cached_results[cache_key].get("third_party_ready", True)
-                buyer.third_party_analysis = cached_results[cache_key].get("analysis", "")
-            elif cache_key in gemini_cache:
-                buyer.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                buyer.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
-            else:
-                buyer.third_party_ready = True
-                buyer.third_party_analysis = ""
+            if buyer.item_id in batch_results:
+                buyer.third_party_ready = batch_results[buyer.item_id].get("third_party_ready", True)
+                buyer.third_party_analysis = batch_results[buyer.item_id].get("analysis", "")
+            elif buyer.item_id in offer_map:
+                cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
+                if cache_key in gemini_cache:
+                    buyer.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
+                    buyer.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
         
         return sellers, buyers
     
