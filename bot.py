@@ -82,6 +82,39 @@ GEMINI_REQUEST_COUNT_DAY = 0
 GEMINI_LAST_RESET_MINUTE = datetime.now()
 GEMINI_LAST_RESET_DAY = datetime.now()
 
+# ========== ОПРЕДЕЛЕНИЕ DATACLASSES ==========
+
+@dataclass
+class P2POffer:
+    side: str
+    price: float
+    amount: float
+    min_amount: float
+    max_amount: float
+    payment_methods: List[str]
+    description: str
+    link: str
+    merchant_name: str
+    item_id: str
+    user_id: str
+    user_mask_id: str
+    remark: str = ""
+    third_party_ready: bool = True
+    token: str = "USDT"
+    fiat: str = "RUB"
+
+@dataclass
+class ArbitrageSignal:
+    seller: P2POffer
+    buyer: P2POffer
+    spread: float
+    profit: float
+    profit_rub: float
+    timestamp: datetime
+    signal_id: str
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
 # Функция для проверки квоты Gemini
 def check_gemini_quota() -> bool:
     """Проверяет, не превышен ли лимит запросов к Gemini"""
@@ -121,7 +154,6 @@ def increment_gemini_count():
     remaining_day = GEMINI_RATE_LIMIT_PER_DAY - GEMINI_REQUEST_COUNT_DAY
     logger.info(f"📊 Gemini: {GEMINI_REQUEST_COUNT_MINUTE}/{GEMINI_RATE_LIMIT_PER_MINUTE} в минуту, {GEMINI_REQUEST_COUNT_DAY}/{GEMINI_RATE_LIMIT_PER_DAY} в день")
 
-# Вспомогательные функции
 def parse_args_with_quotes(text: str) -> List[str]:
     args = []
     current_arg = ""
@@ -172,7 +204,8 @@ async def safe_send_message(message: Message, text: str):
         logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
         await message.answer(text.replace('<', '[').replace('>', ']'))
 
-# Функция для пакетного анализа нескольких сигналов через Gemini (ОДИН ЗАПРОС)
+# ========== ФУНКЦИЯ ПАКЕТНОГО АНАЛИЗА GEMINI ==========
+
 async def analyze_signals_batch(signals: List[Tuple[ArbitrageSignal, int]], user_id: int) -> Dict[str, Dict[str, any]]:
     """
     Анализирует несколько сигналов в одном запросе к Gemini.
@@ -187,23 +220,26 @@ async def analyze_signals_batch(signals: List[Tuple[ArbitrageSignal, int]], user
         logger.warning("⚠️ Квота Gemini исчерпана, пропускаем пакетный анализ")
         return {}
     
-    # Формируем промпт для всех сигналов
+    # Формируем промпт для всех сигналов (полный remark, без обрезки!)
     prompt_parts = []
     for idx, (signal, _) in enumerate(signals):
+        seller_remark = signal.seller.remark if signal.seller.remark else ""
+        buyer_remark = signal.buyer.remark if signal.buyer.remark else ""
+        
         prompt_parts.append(f"""
 СИГНАЛ #{idx + 1}:
 Продавец: {signal.seller.merchant_name}
-Текст продавца: "{signal.seller.remark[:200]}"
+Текст продавца: "{seller_remark}"
 Покупатель: {signal.buyer.merchant_name}
-Текст покупателя: "{signal.buyer.remark[:200]}"
+Текст покупателя: "{buyer_remark}"
 """)
     
     full_prompt = f"""
 Проанализируй следующие объявления и определи для КАЖДОГО, готов ли мерчант принимать платежи от ТРЕТЬИХ ЛИЦ.
 
 Правила:
-- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц", "строго 1 лицо" -> НЕ ГОТОВ (false)
-- Если есть "принимаю от третьих лиц", "можно от друзей" -> ГОТОВ (true)
+- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц", "строго 1 лицо", "первые лица" -> НЕ ГОТОВ (false)
+- Если есть "принимаю от третьих лиц", "можно от друзей", "3-и лица" -> ГОТОВ (true)
 - Если нет упоминаний о третьих лицах -> ГОТОВ (true)
 
 Верни ответ ТОЛЬКО в формате JSON:
@@ -233,7 +269,7 @@ async def analyze_signals_batch(signals: List[Tuple[ArbitrageSignal, int]], user
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     top_p=0.8,
-                    max_output_tokens=500,
+                    max_output_tokens=800,  # Увеличиваем для полных remark
                 )
             )
         )
@@ -267,17 +303,13 @@ async def analyze_signals_batch(signals: List[Tuple[ArbitrageSignal, int]], user
                         result_dict[signal_id] = {
                             "passed": True,
                             "seller_ready": seller_ready,
-                            "buyer_ready": buyer_ready,
-                            "seller_analysis": "",
-                            "buyer_analysis": ""
+                            "buyer_ready": buyer_ready
                         }
                     else:
                         result_dict[signal_id] = {
                             "passed": False,
                             "seller_ready": seller_ready,
-                            "buyer_ready": buyer_ready,
-                            "seller_analysis": "Не готов" if not seller_ready else "",
-                            "buyer_analysis": "Не готов" if not buyer_ready else ""
+                            "buyer_ready": buyer_ready
                         }
                     
                     # Сохраняем в кэш
@@ -289,41 +321,14 @@ async def analyze_signals_batch(signals: List[Tuple[ArbitrageSignal, int]], user
             logger.info(f"✅ Пакетный анализ завершен: {len(result_dict)} сигналов")
             return result_dict
         else:
-            logger.warning(f"⚠️ Не удалось распарсить ответ Gemini")
+            logger.warning(f"⚠️ Не удалось распарсить ответ Gemini: {result_text[:200]}")
             return {}
             
     except Exception as e:
         logger.error(f"❌ Ошибка при пакетном анализе Gemini: {e}")
         return {}
 
-@dataclass
-class P2POffer:
-    side: str
-    price: float
-    amount: float
-    min_amount: float
-    max_amount: float
-    payment_methods: List[str]
-    description: str
-    link: str
-    merchant_name: str
-    item_id: str
-    user_id: str
-    user_mask_id: str
-    remark: str = ""
-    third_party_ready: bool = True
-    token: str = "USDT"
-    fiat: str = "RUB"
-
-@dataclass
-class ArbitrageSignal:
-    seller: P2POffer
-    buyer: P2POffer
-    spread: float
-    profit: float
-    profit_rub: float
-    timestamp: datetime
-    signal_id: str
+# ========== КЛАСС BYBIT P2P КЛИЕНТ ==========
 
 class BybitP2PClient:
     def __init__(self, api_key: str, api_secret: str):
@@ -442,6 +447,8 @@ class BybitP2PClient:
         
         logger.info(f"Получено {len(offers)} объявлений для {side}")
         return offers
+
+# ========== ОСНОВНОЙ КЛАСС БОТА ==========
 
 class P2PArbitrageBot:
     def __init__(self, bot: Bot):
@@ -591,34 +598,34 @@ class P2PArbitrageBot:
         
         # Проверяем, нужно ли пополнять очередь
         queue = user_verified_signals_queue.get(user_id, deque())
-        if len(queue) >= 3:  # Если в очереди достаточно сигналов
+        if len(queue) >= 3:
             logger.info(f"📦 В очереди {len(queue)} сигналов, пополнение не требуется")
             return
         
         gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         
+        # Получаем свежие объявления
+        sellers = await asyncio.get_event_loop().run_in_executor(
+            None, self._fetch_p2p_offers_sync, "SELL"
+        )
+        buyers = await asyncio.get_event_loop().run_in_executor(
+            None, self._fetch_p2p_offers_sync, "BUY"
+        )
+        
+        if not sellers or not buyers:
+            return
+        
+        filters = user_filters.get(user_id, {})
+        
         # Если Gemini выключен - просто добавляем сигналы без проверки
         if not gemini_enabled or not gemini_client:
-            # Получаем свежие сигналы
-            sellers = await asyncio.get_event_loop().run_in_executor(
-                None, self._fetch_p2p_offers_sync, "SELL"
-            )
-            buyers = await asyncio.get_event_loop().run_in_executor(
-                None, self._fetch_p2p_offers_sync, "BUY"
-            )
-            if not sellers or not buyers:
-                return
-            
-            filters = user_filters.get(user_id, {})
             signals = self._find_best_signals(sellers, buyers, filters, max_signals=5)
             
             if signals:
-                # Добавляем в очередь
                 queue = user_verified_signals_queue.get(user_id, deque())
                 for signal in signals:
-                    # Проверяем, не отправляли ли уже
                     if signal.signal_id not in sent_signals.get(user_id, {}):
-                        queue.append((signal, True))  # True = проверен
+                        queue.append((signal, True))
                 user_verified_signals_queue[user_id] = queue
                 logger.info(f"✅ Добавлено {len(signals)} сигналов в очередь (Gemini выключен)")
             return
@@ -627,19 +634,6 @@ class P2PArbitrageBot:
         user_analysis_in_progress[user_id] = True
         
         try:
-            # Получаем свежие объявления
-            sellers = await asyncio.get_event_loop().run_in_executor(
-                None, self._fetch_p2p_offers_sync, "SELL"
-            )
-            buyers = await asyncio.get_event_loop().run_in_executor(
-                None, self._fetch_p2p_offers_sync, "BUY"
-            )
-            
-            if not sellers or not buyers:
-                return
-            
-            filters = user_filters.get(user_id, {})
-            
             # Находим топ-5 потенциальных сигналов
             candidates = self._find_best_signals(sellers, buyers, filters, max_signals=5)
             
@@ -647,49 +641,42 @@ class P2PArbitrageBot:
                 logger.info(f"ℹ️ Нет потенциальных сигналов для пользователя {user_id}")
                 return
             
-            # Проверяем кэш - оставляем только те сигналы, где есть что анализировать
+            # Проверяем кэш
             signals_to_analyze = []
+            signals_already_checked = []
+            
             for signal in candidates:
-                # Проверяем, есть ли уже в кэше
                 seller_cache_key = f"{signal.seller.item_id}_{signal.seller.merchant_name}"
                 buyer_cache_key = f"{signal.buyer.item_id}_{signal.buyer.merchant_name}"
                 
                 if seller_cache_key in gemini_cache and buyer_cache_key in gemini_cache:
-                    # Уже есть в кэше - проверяем готовность
                     seller_ready = gemini_cache[seller_cache_key].get("third_party_ready", True)
                     buyer_ready = gemini_cache[buyer_cache_key].get("third_party_ready", True)
                     if seller_ready and buyer_ready:
-                        signals_to_analyze.append((signal, True))  # True = уже проверен
+                        signals_already_checked.append(signal)
                     continue
                 
-                # Нужно проанализировать
-                signals_to_analyze.append((signal, False))
+                signals_to_analyze.append(signal)
             
             # Если есть сигналы для анализа - отправляем пакетный запрос
-            to_analyze = [s for s, checked in signals_to_analyze if not checked]
-            
-            if to_analyze:
-                # Формируем список для пакетного запроса
-                batch_signals = [(s, user_id) for s in to_analyze]
+            if signals_to_analyze:
+                batch_signals = [(s, user_id) for s in signals_to_analyze]
                 results = await analyze_signals_batch(batch_signals, user_id)
                 
-                # Обновляем сигналы результатами
-                for signal in to_analyze:
+                for signal in signals_to_analyze:
                     if signal.signal_id in results:
                         result = results[signal.signal_id]
                         if result.get("passed", False):
-                            signals_to_analyze.append((signal, True))
+                            signals_already_checked.append(signal)
             
-            # Добавляем проверенные сигналы в очередь (только те, что прошли проверку)
+            # Добавляем проверенные сигналы в очередь
             queue = user_verified_signals_queue.get(user_id, deque())
             added_count = 0
             
-            for signal, checked in signals_to_analyze:
-                if checked:
-                    # Проверяем, не отправляли ли уже
-                    if signal.signal_id not in sent_signals.get(user_id, {}):
-                        queue.append((signal, True))
-                        added_count += 1
+            for signal in signals_already_checked:
+                if signal.signal_id not in sent_signals.get(user_id, {}):
+                    queue.append((signal, True))
+                    added_count += 1
             
             user_verified_signals_queue[user_id] = queue
             logger.info(f"✅ Очередь пополнена: +{added_count} сигналов (всего {len(queue)})")
@@ -733,7 +720,6 @@ class P2PArbitrageBot:
                         signal, verified = queue.popleft()
                         user_verified_signals_queue[user_id] = queue
                         
-                        # Отправляем сигнал
                         await self._send_signal(user_id, signal)
                         if user_id not in sent_signals:
                             sent_signals[user_id] = {}
@@ -769,12 +755,11 @@ class P2PArbitrageBot:
         seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
         
-        # Логируем
         logger.info(f"📝 SIGNAL for user {user_id}:")
         logger.info(f"   SELLER: {signal.seller.merchant_name}")
-        logger.info(f"   REMARK: {signal.seller.remark[:100]}...")
+        logger.info(f"   REMARK: {signal.seller.remark[:200]}..." if signal.seller.remark and len(signal.seller.remark) > 200 else f"   REMARK: {signal.seller.remark}")
         logger.info(f"   BUYER: {signal.buyer.merchant_name}")
-        logger.info(f"   REMARK: {signal.buyer.remark[:100]}...")
+        logger.info(f"   REMARK: {signal.buyer.remark[:200]}..." if signal.buyer.remark and len(signal.buyer.remark) > 200 else f"   REMARK: {signal.buyer.remark}")
         
         seller_third_party = "✅ Готов к платежам от 3-их лиц" if signal.seller.third_party_ready else "❌ Не готов к платежам от 3-их лиц"
         buyer_third_party = "✅ Готов к платежам от 3-их лиц" if signal.buyer.third_party_ready else "❌ Не готов к платежам от 3-их лиц"
@@ -814,7 +799,6 @@ class P2PArbitrageBot:
         cache_size = len(gemini_cache)
         queue_size = len(user_verified_signals_queue.get(user_id, deque()))
         
-        # Статистика квоты
         remaining_minute = GEMINI_RATE_LIMIT_PER_MINUTE - GEMINI_REQUEST_COUNT_MINUTE
         remaining_day = GEMINI_RATE_LIMIT_PER_DAY - GEMINI_REQUEST_COUNT_DAY
         
@@ -856,6 +840,8 @@ class P2PArbitrageBot:
         return "\n".join(settings)
 
 
+# ========== НАСТРОЙКА КОМАНД БОТА ==========
+
 async def set_bot_commands(bot: Bot):
     commands = [
         BotCommand(command="settings", description="📋 Показать настройки"),
@@ -872,11 +858,13 @@ async def set_bot_commands(bot: Bot):
     logger.info("✅ Меню команд установлено")
 
 
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА ==========
+
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 arbitrage_bot = P2PArbitrageBot(bot)
 
-# --- Обработчики команд ---
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -1045,7 +1033,6 @@ async def cmd_gemini_on(message: Message):
         return
     
     gemini_enabled_for_user[user_id] = True
-    # Очищаем кэш при включении
     global gemini_cache
     gemini_cache = {}
     user_verified_signals_queue[user_id] = deque()
@@ -1067,7 +1054,7 @@ async def cmd_gemini_off(message: Message):
     
     await safe_send_message(message, "🤖 Gemini ВЫКЛЮЧЕН!")
 
-# --- Команды для настройки фильтров ---
+# ========== КОМАНДЫ НАСТРОЙКИ ФИЛЬТРОВ ==========
 
 @dp.message(Command("set_exact"))
 async def cmd_set_exact(message: Message):
@@ -1186,6 +1173,8 @@ async def cmd_remove_blacklist(message: Message):
     else:
         await safe_send_message(message, f"⚠️ Слово '{word}' не найдено")
 
+
+# ========== ЗАПУСК БОТА ==========
 
 async def on_startup():
     await set_bot_commands(bot)
