@@ -69,7 +69,7 @@ sent_signals: Dict[int, Dict[str, datetime]] = {}
 user_signal_delay: Dict[int, int] = {}
 
 # Кэш для результатов Gemini (с временем жизни)
-gemini_cache: Dict[str, Dict[str, any]] = {}
+gemini_cache: Dict[str, bool] = {}  # Просто true/false для готовности
 gemini_cache_ttl: Dict[str, datetime] = {}  # Время истечения кэша
 CACHE_TTL_MINUTES = 30  # Кэш живет 30 минут
 
@@ -124,15 +124,10 @@ def check_word_in_text(word: str, text: str) -> bool:
     Проверяет наличие слова в тексте с учетом границ слов.
     Использует регулярные выражения для точного поиска.
     """
-    # Экранируем специальные символы в слове
     escaped_word = re.escape(word)
-    # Создаем паттерн для поиска слова как отдельного слова или части слова
-    # Используем границы слов \b, но также проверяем наличие слова в составе других слов
-    # если слово короткое (до 3 символов), ищем как отдельное слово
     if len(word) <= 3:
         pattern = rf'\b{escaped_word}\b'
     else:
-        # Для длинных слов ищем как часть слова или отдельное слово
         pattern = rf'{escaped_word}'
     
     return bool(re.search(pattern, text, re.IGNORECASE))
@@ -146,47 +141,46 @@ async def safe_send_message(message: Message, text: str):
         logger.warning(f"Ошибка HTML-парсинга, отправляем обычный текст: {e}")
         await message.answer(text.replace('<', '[').replace('>', ']'))
 
-# Функция для массового анализа нескольких объявлений через Gemini
-async def analyze_batch_with_gemini(offers: List[Tuple[str, str, str]]) -> Dict[str, Dict[str, any]]:
+# Функция анализа одного объявления через Gemini (только true/false)
+async def analyze_single_with_gemini(remark: str, merchant_name: str, item_id: str) -> bool:
     """
-    Анализирует несколько объявлений через Gemini в одном запросе.
-    offers: список кортежей (item_id, merchant_name, remark)
-    Возвращает словарь с результатами по каждому item_id
+    Анализирует одно объявление через Gemini.
+    Возвращает True - готов к 3-им лицам, False - не готов.
     """
-    if not offers or not gemini_client:
-        return {}
+    if not gemini_client:
+        return True
     
-    # Формируем запрос для анализа всех объявлений
-    offers_text = "\n\n".join([
-        f"Объявление {i+1} (ID: {item_id}, Мерчант: {merchant_name}):\nТекст: \"{remark}\""
-        for i, (item_id, merchant_name, remark) in enumerate(offers)
-    ])
+    # Проверяем кэш
+    cache_key = f"{item_id}_{merchant_name}"
+    if cache_key in gemini_cache:
+        cache_time = gemini_cache_ttl.get(cache_key)
+        if cache_time and datetime.now() - cache_time < timedelta(minutes=CACHE_TTL_MINUTES):
+            logger.info(f"♻️ Использован кэш Gemini для {merchant_name} (ID: {item_id}): {gemini_cache[cache_key]}")
+            return gemini_cache[cache_key]
+    
+    if not remark or not remark.strip():
+        gemini_cache[cache_key] = True
+        gemini_cache_ttl[cache_key] = datetime.now()
+        return True
     
     prompt = f"""
-Анализ объявлений на предмет готовности принимать платежи от ТРЕТЬИХ ЛИЦ.
+Анализ объявления от {merchant_name}:
+Текст: "{remark}"
 
-Третьи лица - платеж совершает не покупатель, а другое лицо.
+Готов ли мерчант принимать платежи от ТРЕТЬИХ ЛИЦ?
+(Третьи лица - платеж совершает не покупатель, а другое лицо)
 
-Правила для каждого объявления:
-- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц", "ТОЛЬКО 1 ЛИЦА", "СТРОГО 1 Лица", "от первого лица" -> НЕ ГОТОВ
+Правила:
+- Если есть "только от себя", "только свои карты", "не принимаю от третьих лиц", "ТОЛЬКО 1 ЛИЦА", "СТРОГО 1 Лица", "от первого лица", "только первые лица" -> НЕ ГОТОВ
 - Если есть "принимаю от третьих лиц", "можно от друзей" -> ГОТОВ
-- Если нет упоминаний или есть "от 3-х лиц не принимаю" -> НЕ ГОТОВ
 - Если есть "ЛК на руках" - это НЕ значит готовность к 3-им лицам
+- Если нет упоминаний о 3-их лицах -> ГОТОВ (по умолчанию)
 
-Верни ТОЛЬКО JSON-массив с результатами для каждого объявления в том же порядке.
-Используй числовые id (1, 2, 3...) в том же порядке, как в запросе.
-
-Пример ответа:
-[
-  {{"id": 1, "ready": false, "comment": "Указано 'ТОЛЬКО 1 ЛИЦА'"}},
-  {{"id": 2, "ready": true, "comment": "Нет запретов"}}
-]
-
-ВЕРНИ ТОЛЬКО JSON, БЕЗ ДРУГОГО ТЕКСТА!
+Верни ТОЛЬКО: true (если готов) или false (если не готов)
 """
     
     try:
-        logger.info(f"📤 Отправка батча из {len(offers)} объявлений в Gemini")
+        logger.info(f"📤 Отправка запроса в Gemini для {merchant_name} (ID: {item_id})")
         
         response = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -196,88 +190,38 @@ async def analyze_batch_with_gemini(offers: List[Tuple[str, str, str]]) -> Dict[
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     top_p=0.8,
-                    max_output_tokens=800,
+                    max_output_tokens=50,
                 )
             )
         )
         
-        result_text = response.text.strip()
-        logger.info(f"📥 Ответ Gemini (батч): {result_text[:500]}...")
+        result_text = response.text.strip().lower()
+        logger.info(f"📥 Ответ Gemini для {merchant_name}: {result_text}")
         
-        # Удаляем маркеры кода если есть
-        result_text = re.sub(r'```json\s*', '', result_text)
-        result_text = re.sub(r'```\s*', '', result_text)
-        result_text = result_text.strip()
+        # Определяем результат
+        if "true" in result_text:
+            result = True
+        elif "false" in result_text:
+            result = False
+        else:
+            # Если не поняли ответ - считаем готовым
+            result = True
         
-        # Парсим JSON
-        try:
-            data = json.loads(result_text)
-            results = {}
-            if isinstance(data, list):
-                for item in data:
-                    # Поддерживаем как числовые, так и строковые id
-                    item_id = item.get("id")
-                    if item_id is not None:
-                        # Преобразуем в строку для единообразия
-                        item_id_str = str(item_id)
-                        results[item_id_str] = {
-                            "third_party_ready": item.get("ready", True),
-                            "analysis": item.get("comment", "")
-                        }
-                return results
-            else:
-                logger.warning(f"Ожидался массив, получено: {type(data)}")
-                return {}
-        except json.JSONDecodeError as e:
-            logger.error(f"Ошибка парсинга JSON: {e}")
-            # Пробуем извлечь JSON из текста
-            json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
-            if json_match:
-                try:
-                    data = json.loads(json_match.group())
-                    results = {}
-                    if isinstance(data, list):
-                        for item in data:
-                            item_id = item.get("id")
-                            if item_id is not None:
-                                item_id_str = str(item_id)
-                                results[item_id_str] = {
-                                    "third_party_ready": item.get("ready", True),
-                                    "analysis": item.get("comment", "")
-                                }
-                        return results
-                except:
-                    pass
-            return {}
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка батч-анализа Gemini: {e}")
-        return {}
-
-# Функция анализа remark через Gemini (с батчингом и кэшем)
-async def analyze_with_gemini(remark: str, merchant_name: str, item_id: str, user_id: int = None) -> Dict[str, any]:
-    """
-    Анализирует remark через Gemini с использованием кэша и батчинга.
-    """
-    if not gemini_client:
-        return {"third_party_ready": True, "analysis": "Gemini не доступен"}
-    
-    # Проверяем кэш
-    cache_key = f"{item_id}_{merchant_name}"
-    if cache_key in gemini_cache:
-        cache_time = gemini_cache_ttl.get(cache_key)
-        if cache_time and datetime.now() - cache_time < timedelta(minutes=CACHE_TTL_MINUTES):
-            logger.info(f"♻️ Использован кэш Gemini для {merchant_name} (ID: {item_id})")
-            return gemini_cache[cache_key]
-    
-    if not remark or not remark.strip():
-        result = {"third_party_ready": True, "analysis": ""}
+        # Сохраняем в кэш
         gemini_cache[cache_key] = result
         gemini_cache_ttl[cache_key] = datetime.now()
+        
+        logger.info(f"✅ Gemini анализ для {merchant_name}: готов={result}")
+        logger.info(f"📝 REMARK: {remark}")
+        
         return result
-    
-    # Возвращаем дефолтное значение (будет проанализировано позже в батче)
-    return {"third_party_ready": True, "analysis": "Ожидает анализа"}
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка Gemini для {merchant_name}: {e}")
+        # При ошибке считаем готовым
+        gemini_cache[cache_key] = True
+        gemini_cache_ttl[cache_key] = datetime.now()
+        return True
 
 @dataclass
 class P2POffer:
@@ -296,7 +240,6 @@ class P2POffer:
     user_mask_id: str
     remark: str = ""
     third_party_ready: bool = True
-    third_party_analysis: str = ""
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -408,7 +351,6 @@ class BybitP2PClient:
                 user_id = str(item.get("uid", ""))
                 user_mask_id = str(item.get("userMaskId", ""))
                 
-                # Получаем remark из объявления
                 remark = item.get("remark", "")
                 
                 offer = P2POffer(
@@ -425,8 +367,7 @@ class BybitP2PClient:
                     user_id=user_id,
                     user_mask_id=user_mask_id,
                     remark=remark,
-                    third_party_ready=True,
-                    third_party_analysis=""
+                    third_party_ready=True
                 )
                 offers.append(offer)
             except (ValueError, KeyError) as e:
@@ -444,7 +385,7 @@ class P2PArbitrageBot:
         self.is_running = False
         self.monitor_task: Optional[asyncio.Task] = None
         self.bybit_client = None
-        self._stop_requested = False  # Флаг для экстренной остановки
+        self._stop_requested = False
         
         if BYBIT_API_KEY and BYBIT_API_SECRET:
             self.bybit_client = BybitP2PClient(BYBIT_API_KEY, BYBIT_API_SECRET)
@@ -474,7 +415,6 @@ class P2PArbitrageBot:
     async def stop_for_user(self, user_id: int):
         """Остановка мониторинга для конкретного пользователя"""
         user_subscriptions[user_id] = False
-        # Очищаем кэш отправленных сигналов для пользователя
         if user_id in sent_signals:
             sent_signals[user_id].clear()
         logger.info(f"Мониторинг остановлен для пользователя {user_id}")
@@ -499,22 +439,15 @@ class P2PArbitrageBot:
         if not filters:
             return True, "OK"
         
-        # Проверка черного списка (только по нику мерчанта)
         blacklist = filters.get("blacklist", [])
         if blacklist:
-            # Проверяем только имя мерчанта
             merchant_name_lower = offer.merchant_name.lower()
             
-            # Логируем для отладки
-            logger.debug(f"Проверка черного списка для мерчанта {offer.merchant_name}: {blacklist}")
-            
             for word in blacklist:
-                # Используем улучшенную проверку с регулярными выражениями
                 if check_word_in_text(word, merchant_name_lower):
                     logger.info(f"Найдено запрещенное слово '{word}' в нике мерчанта {offer.merchant_name}")
                     return False, f"Найдено запрещенное слово '{word}' в нике мерчанта {offer.merchant_name}"
         
-        # Проверка суммы
         if filters.get("exact_amount"):
             if not (offer.min_amount <= filters["exact_amount"] <= offer.max_amount):
                 return False, f"Сумма {filters['exact_amount']:.0f}₽ не входит в лимиты {offer.min_amount:.0f}-{offer.max_amount:.0f}₽"
@@ -535,139 +468,48 @@ class P2PArbitrageBot:
             return "Ссылка недоступна"
         return f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item"
     
-    def _generate_order_url(self, item_id: str) -> str:
-        """Генерирует ссылку на ордер Bybit"""
-        if not item_id or item_id == "0" or item_id == "":
-            return "Ссылка недоступна"
-        return f"https://www.bybit.com/ru-RU/p2p/order/{item_id}"
-    
     async def _analyze_offers_with_gemini(self, sellers: List[P2POffer], buyers: List[P2POffer], user_id: int) -> Tuple[List[P2POffer], List[P2POffer]]:
         """Анализирует объявления через Gemini для пользователя"""
         gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         
         if not gemini_enabled or not gemini_client:
-            # Если Gemini выключен - просто помечаем все как готовые
             for seller in sellers:
                 seller.third_party_ready = True
-                seller.third_party_analysis = ""
             for buyer in buyers:
                 buyer.third_party_ready = True
-                buyer.third_party_analysis = ""
             return sellers, buyers
         
         # Собираем все объявления с remark для анализа
-        all_offers = []
-        offer_map = {}  # Для быстрого поиска по item_id
+        offers_to_analyze = []
         
-        # Добавляем продавцов
         for seller in sellers:
             if seller.remark and seller.remark.strip():
-                # Проверяем кэш
                 cache_key = f"{seller.item_id}_{seller.merchant_name}"
                 if cache_key in gemini_cache:
                     cache_time = gemini_cache_ttl.get(cache_key)
                     if cache_time and datetime.now() - cache_time < timedelta(minutes=CACHE_TTL_MINUTES):
-                        # Используем кэш
-                        seller.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                        seller.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
+                        seller.third_party_ready = gemini_cache[cache_key]
                         continue
-                
-                # Добавляем для анализа
-                all_offers.append((seller.item_id, seller.merchant_name, seller.remark))
-                offer_map[seller.item_id] = seller
+                offers_to_analyze.append(seller)
         
-        # Добавляем покупателей
         for buyer in buyers:
             if buyer.remark and buyer.remark.strip():
                 cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
                 if cache_key in gemini_cache:
                     cache_time = gemini_cache_ttl.get(cache_key)
                     if cache_time and datetime.now() - cache_time < timedelta(minutes=CACHE_TTL_MINUTES):
-                        buyer.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                        buyer.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
+                        buyer.third_party_ready = gemini_cache[cache_key]
                         continue
-                
-                all_offers.append((buyer.item_id, buyer.merchant_name, buyer.remark))
-                offer_map[buyer.item_id] = buyer
+                offers_to_analyze.append(buyer)
         
-        if not all_offers:
-            # Нет объявлений с remark
-            for seller in sellers:
-                seller.third_party_ready = True
-                seller.third_party_analysis = ""
-            for buyer in buyers:
-                buyer.third_party_ready = True
-                buyer.third_party_analysis = ""
-            return sellers, buyers
-        
-        # Разбиваем на батчи по 5
-        BATCH_SIZE = 5
-        batch_results = {}
-        
-        for i in range(0, len(all_offers), BATCH_SIZE):
-            batch = all_offers[i:i+BATCH_SIZE]
-            
-            # Отправляем батч в Gemini
-            results = await analyze_batch_with_gemini(batch)
-            
-            # Сохраняем результаты
-            for idx, (item_id, merchant_name, remark) in enumerate(batch, 1):
-                # Пробуем найти результат по индексу (1-based)
-                idx_str = str(idx)
-                if idx_str in results:
-                    result = results[idx_str]
-                    cache_key = f"{item_id}_{merchant_name}"
-                    gemini_cache[cache_key] = result
-                    gemini_cache_ttl[cache_key] = datetime.now()
-                    batch_results[item_id] = result
-                    logger.info(f"✅ Gemini анализ для {merchant_name} (ID: {item_id}): ready={result['third_party_ready']}")
-                    logger.info(f"📝 REMARK: {remark}")
-                    logger.info(f"📝 Ответ: {result}")
-                else:
-                    # Ищем по item_id
-                    if item_id in results:
-                        result = results[item_id]
-                        cache_key = f"{item_id}_{merchant_name}"
-                        gemini_cache[cache_key] = result
-                        gemini_cache_ttl[cache_key] = datetime.now()
-                        batch_results[item_id] = result
-                        logger.info(f"✅ Gemini анализ для {merchant_name} (ID: {item_id}): ready={result['third_party_ready']}")
-                        logger.info(f"📝 REMARK: {remark}")
-                        logger.info(f"📝 Ответ: {result}")
-                    else:
-                        # Не нашли результат - используем дефолтный
-                        default_result = {"third_party_ready": True, "analysis": ""}
-                        cache_key = f"{item_id}_{merchant_name}"
-                        gemini_cache[cache_key] = default_result
-                        gemini_cache_ttl[cache_key] = datetime.now()
-                        batch_results[item_id] = default_result
-                        logger.warning(f"⚠️ Нет результата для {merchant_name} (ID: {item_id}), используем дефолтный")
-            
-            # Задержка между батчами
-            if i + BATCH_SIZE < len(all_offers):
-                await asyncio.sleep(3)
-        
-        # Применяем результаты ко всем объявлениям
-        for seller in sellers:
-            if seller.item_id in batch_results:
-                seller.third_party_ready = batch_results[seller.item_id].get("third_party_ready", True)
-                seller.third_party_analysis = batch_results[seller.item_id].get("analysis", "")
-            elif seller.item_id in offer_map:
-                # Если есть в offer_map, но нет в результатах - используем кэш
-                cache_key = f"{seller.item_id}_{seller.merchant_name}"
-                if cache_key in gemini_cache:
-                    seller.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                    seller.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
-        
-        for buyer in buyers:
-            if buyer.item_id in batch_results:
-                buyer.third_party_ready = batch_results[buyer.item_id].get("third_party_ready", True)
-                buyer.third_party_analysis = batch_results[buyer.item_id].get("analysis", "")
-            elif buyer.item_id in offer_map:
-                cache_key = f"{buyer.item_id}_{buyer.merchant_name}"
-                if cache_key in gemini_cache:
-                    buyer.third_party_ready = gemini_cache[cache_key].get("third_party_ready", True)
-                    buyer.third_party_analysis = gemini_cache[cache_key].get("analysis", "")
+        # Анализируем по одному
+        for offer in offers_to_analyze:
+            result = await analyze_single_with_gemini(
+                offer.remark, 
+                offer.merchant_name, 
+                offer.item_id
+            )
+            offer.third_party_ready = result
         
         return sellers, buyers
     
@@ -677,49 +519,38 @@ class P2PArbitrageBot:
         if not sellers or not buyers:
             return []
         
-        # Проверяем, включен ли Gemini для пользователя
         gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         
-        # Фильтруем продавцов и покупателей по условиям
         filtered_sellers = []
         for seller in sellers:
             passes, _ = self._check_offer_conditions(seller, user_filters)
             if passes:
-                # Если Gemini включен - проверяем seller
                 if gemini_enabled and gemini_client:
-                    # Если seller не готов к платежам от 3-их лиц - пропускаем
                     if not seller.third_party_ready:
                         logger.debug(f"❌ Seller {seller.merchant_name} не готов к 3-им лицам - пропускаем")
                         continue
-                
                 filtered_sellers.append(seller)
         
         filtered_buyers = []
         for buyer in buyers:
             passes, _ = self._check_offer_conditions(buyer, user_filters)
             if passes:
-                # Если Gemini включен - проверяем buyer
                 if gemini_enabled and gemini_client:
-                    # Если buyer не готов к платежам от 3-их лиц - пропускаем
                     if not buyer.third_party_ready:
                         logger.debug(f"❌ Buyer {buyer.merchant_name} не готов к 3-им лицам - пропускаем")
                         continue
-                
                 filtered_buyers.append(buyer)
         
         if not filtered_sellers or not filtered_buyers:
             logger.info(f"⚠️ Нет подходящих объявлений после фильтрации")
             return []
         
-        # Сортируем продавцов по возрастанию цены (самые дешевые сверху)
         filtered_sellers.sort(key=lambda x: x.price)
-        # Сортируем покупателей по убыванию цены (самые дорогие сверху)
         filtered_buyers.sort(key=lambda x: x.price, reverse=True)
         
         signals = []
         min_spread = user_filters.get("min_spread", 0.5)
         
-        # Перебираем всех продавцов и покупателей
         for seller in filtered_sellers[:20]:
             for buyer in filtered_buyers[:20]:
                 if seller.price >= buyer.price:
@@ -730,7 +561,6 @@ class P2PArbitrageBot:
                 if spread < min_spread:
                     continue
                 
-                # Проверяем пересечение лимитов
                 max_trade_amount = min(seller.max_amount, buyer.max_amount)
                 min_trade_amount = max(seller.min_amount, buyer.min_amount)
                 
@@ -745,7 +575,6 @@ class P2PArbitrageBot:
                     if min_trade_amount > user_filters["max_amount"]:
                         continue
                 
-                # Расчет прибыли
                 trade_amount = max_trade_amount
                 usdt_amount = trade_amount / seller.price if seller.price > 0 else 0
                 profit_per_usdt = buyer.price - seller.price
@@ -794,7 +623,6 @@ class P2PArbitrageBot:
                     await asyncio.sleep(30)
                     continue
                 
-                # Получаем список активных пользователей ДО начала цикла
                 active_users = []
                 for user_id, is_active in user_subscriptions.items():
                     if is_active and not self._stop_requested:
@@ -805,12 +633,10 @@ class P2PArbitrageBot:
                     continue
                 
                 for user_id in active_users:
-                    # Проверяем флаг остановки перед каждым пользователем
                     if not self.is_running or self._stop_requested:
                         logger.info(f"Остановка мониторинга по запросу пользователя {user_id}")
                         return
                     
-                    # Проверяем, активен ли пользователь
                     if not user_subscriptions.get(user_id, False):
                         continue
                     
@@ -824,7 +650,6 @@ class P2PArbitrageBot:
                         None, self._fetch_p2p_offers_sync, "SELL"
                     )
                     
-                    # Проверяем флаг остановки после получения sellers
                     if not self.is_running or self._stop_requested:
                         logger.info(f"Остановка мониторинга после получения SELL объявлений")
                         return
@@ -833,7 +658,6 @@ class P2PArbitrageBot:
                         None, self._fetch_p2p_offers_sync, "BUY"
                     )
                     
-                    # Проверяем флаг остановки после получения buyers
                     if not self.is_running or self._stop_requested:
                         logger.info(f"Остановка мониторинга после получения BUY объявлений")
                         return
@@ -841,7 +665,6 @@ class P2PArbitrageBot:
                     if not sellers or not buyers:
                         continue
                     
-                    # Анализируем объявления через Gemini (если включено)
                     sellers, buyers = await self._analyze_offers_with_gemini(sellers, buyers, user_id)
                     
                     signals = self._find_all_arbitrage_signals(sellers, buyers, filters, user_id)
@@ -852,19 +675,16 @@ class P2PArbitrageBot:
                         if user_id not in sent_signals:
                             sent_signals[user_id] = {}
                         
-                        # Получаем задержку для пользователя (по умолчанию 4 секунды)
                         delay_seconds = user_signal_delay.get(user_id, 4)
                         
                         sent_count = 0
                         skipped_count = 0
                         
                         for signal in signals[:30]:
-                            # Проверяем флаг остановки перед отправкой каждого сигнала
                             if not self.is_running or self._stop_requested:
                                 logger.info(f"Остановка мониторинга во время отправки сигналов")
                                 return
                             
-                            # Проверяем, активен ли пользователь
                             if not user_subscriptions.get(user_id, False):
                                 logger.info(f"Пользователь {user_id} отключил мониторинг, пропускаем сигналы")
                                 break
@@ -875,7 +695,6 @@ class P2PArbitrageBot:
                                 sent_count += 1
                                 logger.info(f"Отправлен сигнал #{sent_count}: SELL={signal.seller.merchant_name} {signal.seller.price:.2f}₽, BUY={signal.buyer.merchant_name} {signal.buyer.price:.2f}₽, прибыль={signal.profit_rub:.2f}₽")
                                 
-                                # Используем задержку между сигналами
                                 if sent_count < len(signals[:30]):
                                     await asyncio.sleep(delay_seconds)
                             else:
@@ -907,20 +726,18 @@ class P2PArbitrageBot:
         trade_amount = min(signal.seller.max_amount, signal.buyer.max_amount)
         usdt_amount = trade_amount / signal.seller.price if signal.seller.price > 0 else 0
         
-        # Генерируем ссылки на профили используя user_mask_id
         seller_profile_url = self._generate_profile_url(signal.seller.user_mask_id)
         buyer_profile_url = self._generate_profile_url(signal.buyer.user_mask_id)
         
-        # Логируем remark для обоих объявлений (полный текст)
+        # Логируем remark
         logger.info(f"📝 SIGNAL REMARKS for user {user_id}:")
         logger.info(f"   SELLER (merchant: {signal.seller.merchant_name}, ID: {signal.seller.item_id}) REMARK: {signal.seller.remark}")
         logger.info(f"   BUYER (merchant: {signal.buyer.merchant_name}, ID: {signal.buyer.item_id}) REMARK: {signal.buyer.remark}")
         
-        # Определяем статус third_party (без комментариев)
+        # Только статус готовности, без комментариев
         seller_third_party = "✅ Готов" if signal.seller.third_party_ready else "❌ Не готов"
         buyer_third_party = "✅ Готов" if signal.buyer.third_party_ready else "❌ Не готов"
         
-        # Формируем сообщение
         message = f"""🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥
 
 🟢 ПРОДАВЕЦ (SELLER)
@@ -1165,7 +982,6 @@ async def cmd_start_monitoring(message: Message):
         )
         return
     
-    # Очищаем старые сигналы при новом запуске
     sent_signals[user_id] = {}
     
     user_subscriptions[user_id] = True
@@ -1186,10 +1002,8 @@ async def cmd_stop_monitoring(message: Message):
     """Остановка мониторинга"""
     user_id = message.from_user.id
     
-    # Немедленно останавливаем для этого пользователя
     user_subscriptions[user_id] = False
     
-    # Очищаем кэш отправленных сигналов
     if user_id in sent_signals:
         sent_signals[user_id].clear()
     
@@ -1254,7 +1068,6 @@ async def cmd_clear_filters(message: Message):
     user_filters[user_id] = {}
     user_subscriptions[user_id] = False
     sent_signals[user_id] = {}
-    # Задержку и Gemini НЕ сбрасываем
     await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен. Задержка и Gemini сохранены.")
 
 @dp.message(Command("gemini_on"))
@@ -1270,7 +1083,6 @@ async def cmd_gemini_on(message: Message):
         return
     
     gemini_enabled_for_user[user_id] = True
-    # Очищаем кэш при включении
     global gemini_cache, gemini_cache_ttl
     gemini_cache = {}
     gemini_cache_ttl = {}
