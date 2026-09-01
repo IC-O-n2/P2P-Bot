@@ -45,7 +45,9 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 # Инициализация Gemini (если есть ключ)
 gemini_client = None
 gemini_enabled_for_user: Dict[int, bool] = {}
-gemini_available = True  # Флаг доступности Gemini
+gemini_available = True
+gemini_failure_start: Optional[datetime] = None
+GEMINI_FAILURE_TIMEOUT = 300  # 5 минут ожидания перед переключением
 
 if GEMINI_API_KEY:
     try:
@@ -151,14 +153,13 @@ async def wait_for_gemini_quota():
 # Функция проверки доступности Gemini
 async def check_gemini_availability():
     """Проверяет, доступна ли модель Gemini"""
-    global gemini_available
+    global gemini_available, gemini_failure_start
     
     if not gemini_client:
         gemini_available = False
         return False
     
     try:
-        # Пробный запрос к Gemini
         test_prompt = "Ответь только: ok"
         
         response = await asyncio.get_event_loop().run_in_executor(
@@ -173,8 +174,24 @@ async def check_gemini_availability():
             )
         )
         
-        gemini_available = True
-        logger.info("✅ Gemini доступен и работает")
+        # Если до этого был сбой - сбрасываем счетчик
+        if not gemini_available:
+            gemini_available = True
+            gemini_failure_start = None
+            logger.info("✅ Gemini восстановился!")
+            
+            # Уведомляем всех пользователей о восстановлении
+            for user_id, enabled in gemini_enabled_for_user.items():
+                if enabled:
+                    try:
+                        await bot.send_message(
+                            user_id,
+                            "✅ Gemini восстановился и снова работает!\n\n"
+                            "Режим проверки 3-их лиц автоматически включен."
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка уведомления пользователя {user_id}: {e}")
+        
         return True
         
     except Exception as e:
@@ -318,7 +335,7 @@ class P2POffer:
     remark: str = ""
     third_party_ready: bool = True
     third_party_analyzed: bool = False
-    gemini_error: bool = False  # Флаг ошибки Gemini
+    gemini_error: bool = False
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -478,7 +495,6 @@ class P2PArbitrageBot:
         self._stop_requested = False
         self.monitor_task = asyncio.create_task(self._monitor_loop())
         
-        # Запускаем проверку Gemini при старте
         if gemini_client:
             self._gemini_check_task = asyncio.create_task(self._periodic_gemini_check())
         
@@ -507,7 +523,7 @@ class P2PArbitrageBot:
     async def _periodic_gemini_check(self):
         """Периодическая проверка доступности Gemini"""
         while self.is_running and not self._stop_requested:
-            await asyncio.sleep(120)  # Проверяем каждые 2 минуты
+            await asyncio.sleep(120)
             if gemini_client:
                 await check_gemini_availability()
     
@@ -719,7 +735,6 @@ class P2PArbitrageBot:
                     if not seller.third_party_analyzed:
                         logger.debug(f"⏳ Seller {seller.merchant_name} еще не проанализирован Gemini - пропускаем")
                         continue
-                    # Если есть ошибка Gemini, пропускаем объявление (будет показано как "Нейросеть недоступна")
                     if seller.gemini_error:
                         logger.debug(f"⚠️ Seller {seller.merchant_name} - ошибка Gemini, пропускаем")
                         continue
@@ -817,6 +832,9 @@ class P2PArbitrageBot:
             logger.debug(f"Очищено {len(old_signals)} старых сигналов для пользователя {user_id}")
     
     async def _monitor_loop(self):
+        """Основной цикл мониторинга с авто-переключением Gemini"""
+        global gemini_available, gemini_failure_start
+        
         while self.is_running and not self._stop_requested:
             try:
                 if not self.bybit_client:
@@ -844,6 +862,40 @@ class P2PArbitrageBot:
                     filters = user_filters.get(user_id, {})
                     if not filters:
                         continue
+                    
+                    # Проверяем статус Gemini для пользователя
+                    gemini_enabled = gemini_enabled_for_user.get(user_id, False)
+                    
+                    # Если Gemini включен, но недоступен - запускаем таймер авто-отключения
+                    if gemini_enabled and not gemini_available and gemini_client:
+                        if gemini_failure_start is None:
+                            gemini_failure_start = datetime.now()
+                            logger.warning(f"⚠️ Gemini недоступен для пользователя {user_id}, начинаю отсчет")
+                        
+                        elapsed = (datetime.now() - gemini_failure_start).seconds
+                        
+                        if elapsed > GEMINI_FAILURE_TIMEOUT:
+                            # Автоматически отключаем Gemini для пользователя
+                            gemini_enabled_for_user[user_id] = False
+                            logger.warning(f"🔄 Gemini недоступен более {GEMINI_FAILURE_TIMEOUT}с, автоматически переключен в режим off для пользователя {user_id}")
+                            
+                            try:
+                                await self.bot.send_message(
+                                    user_id,
+                                    "⚠️ Gemini временно недоступен!\n\n"
+                                    "Бот автоматически переключен в режим БЕЗ проверки 3-их лиц.\n"
+                                    "Сигналы будут приходить, но без статуса готовности к платежам от 3-их лиц.\n\n"
+                                    "Как только Gemini восстановится, режим вернется автоматически.\n"
+                                    "Или вы можете включить его вручную командой /gemini_on"
+                                )
+                            except Exception as e:
+                                logger.error(f"Ошибка уведомления пользователя {user_id}: {e}")
+                            
+                            gemini_failure_start = None
+                    else:
+                        # Если Gemini доступен или выключен - сбрасываем счетчик
+                        if gemini_available or not gemini_client:
+                            gemini_failure_start = None
                     
                     self._clean_old_signals(user_id)
                     
@@ -907,6 +959,24 @@ class P2PArbitrageBot:
                             logger.info(f"Новых сигналов нет для пользователя {user_id} (все {len(signals)} уже отправлены)")
                     else:
                         logger.info(f"ℹ️ Сигналов не найдено для пользователя {user_id}")
+                
+                # Периодическая проверка Gemini (раз в 2 минуты)
+                if gemini_client and not gemini_available:
+                    await check_gemini_availability()
+                    if gemini_available:
+                        gemini_failure_start = None
+                        logger.info("✅ Gemini восстановился!")
+                        # Возвращаем режим для всех пользователей, у которых был включен
+                        for uid, enabled in gemini_enabled_for_user.items():
+                            if enabled:
+                                try:
+                                    await self.bot.send_message(
+                                        uid,
+                                        "✅ Gemini восстановился и снова работает!\n\n"
+                                        "Режим проверки 3-их лиц автоматически включен."
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Ошибка уведомления пользователя {uid}: {e}")
                 
                 await asyncio.sleep(25)
                 
@@ -1303,7 +1373,9 @@ async def cmd_gemini_on(message: Message):
             message,
             "⚠️ Gemini включен, но модель недоступна!\n"
             "Проверьте название модели в настройках бота.\n"
-            "Попробуйте использовать: gemini-3.5-flash-lite"
+            "Попробуйте использовать: gemini-3.5-flash-lite\n\n"
+            "Бот будет работать в режиме БЕЗ проверки 3-их лиц,\n"
+            "пока Gemini не станет доступен."
         )
         return
     
