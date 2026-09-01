@@ -45,7 +45,7 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 # Инициализация Gemini (если есть ключ)
 gemini_client = None
 gemini_enabled_for_user: Dict[int, bool] = {}
-gemini_available = True
+gemini_available = True  # Флаг доступности Gemini
 
 if GEMINI_API_KEY:
     try:
@@ -158,6 +158,7 @@ async def check_gemini_availability():
         return False
     
     try:
+        # Пробный запрос к Gemini
         test_prompt = "Ответь только: ok"
         
         response = await asyncio.get_event_loop().run_in_executor(
@@ -197,6 +198,7 @@ async def analyze_single_with_gemini(remark: str, merchant_name: str, item_id: s
     if not gemini_client or not gemini_available:
         return {"ready": True, "analyzed": True, "gemini_error": True}
     
+    # Проверяем кэш
     cache_key = f"{item_id}_{merchant_name}"
     if cache_key in gemini_cache:
         cache_time = gemini_cache_ttl.get(cache_key)
@@ -288,6 +290,7 @@ async def analyze_single_with_gemini(remark: str, merchant_name: str, item_id: s
         error_msg = str(e)
         logger.error(f"❌ Ошибка Gemini для {merchant_name}: {error_msg[:100]}")
         
+        # Проверяем, не недоступна ли модель
         if "404" in error_msg or "NOT_FOUND" in error_msg:
             gemini_available = False
             logger.error("🚨 Модель Gemini недоступна! Все последующие запросы будут пропущены.")
@@ -315,7 +318,7 @@ class P2POffer:
     remark: str = ""
     third_party_ready: bool = True
     third_party_analyzed: bool = False
-    gemini_error: bool = False
+    gemini_error: bool = False  # Флаг ошибки Gemini
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -475,6 +478,7 @@ class P2PArbitrageBot:
         self._stop_requested = False
         self.monitor_task = asyncio.create_task(self._monitor_loop())
         
+        # Запускаем проверку Gemini при старте
         if gemini_client:
             self._gemini_check_task = asyncio.create_task(self._periodic_gemini_check())
         
@@ -503,7 +507,7 @@ class P2PArbitrageBot:
     async def _periodic_gemini_check(self):
         """Периодическая проверка доступности Gemini"""
         while self.is_running and not self._stop_requested:
-            await asyncio.sleep(120)
+            await asyncio.sleep(120)  # Проверяем каждые 2 минуты
             if gemini_client:
                 await check_gemini_availability()
     
@@ -563,9 +567,10 @@ class P2PArbitrageBot:
         """Анализирует объявления через Gemini для пользователя"""
         global gemini_available
         
-        check_enabled = gemini_enabled_for_user.get(user_id, False)
+        gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         
-        if not check_enabled or not gemini_client or not gemini_available:
+        # Если Gemini выключен или недоступен - все объявления считаются готовыми
+        if not gemini_enabled or not gemini_client or not gemini_available:
             for seller in sellers:
                 seller.third_party_ready = True
                 seller.third_party_analyzed = True
@@ -637,7 +642,7 @@ class P2PArbitrageBot:
                     other_offers.append(offer)
             
             offers_to_analyze = (priority_offers + other_offers)[:MAX_ANALYZE_PER_CYCLE]
-            logger.info(f"📊 Для анализа выбрано {len(offers_to_analyze)} объявлений из {len(offers_to_analyze) + len(other_offers)} (остальные в следующем цикле)")
+            logger.info(f"📊 Для Gemini выбрано {len(offers_to_analyze)} объявлений из {len(offers_to_analyze) + len(other_offers)} (остальные в следующем цикле)")
         
         analyzed_count = 0
         for offer in offers_to_analyze:
@@ -695,7 +700,7 @@ class P2PArbitrageBot:
                     buyer.third_party_analyzed = False
                     buyer.gemini_error = False
         
-        logger.info(f"✅ Проанализировано: {analyzed_count} объявлений, всего в кэше: {len(gemini_cache)}")
+        logger.info(f"✅ Проанализировано Gemini: {analyzed_count} объявлений, всего в кэше: {len(gemini_cache)}")
         
         return sellers, buyers
     
@@ -704,18 +709,19 @@ class P2PArbitrageBot:
         if not sellers or not buyers:
             return []
         
-        check_enabled = gemini_enabled_for_user.get(user_id, False)
+        gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         
         filtered_sellers = []
         for seller in sellers:
             passes, _ = self._check_offer_conditions(seller, user_filters)
             if passes:
-                if check_enabled and gemini_client:
+                if gemini_enabled and gemini_client:
                     if not seller.third_party_analyzed:
-                        logger.debug(f"⏳ Seller {seller.merchant_name} еще не проанализирован - пропускаем")
+                        logger.debug(f"⏳ Seller {seller.merchant_name} еще не проанализирован Gemini - пропускаем")
                         continue
+                    # Если есть ошибка Gemini, пропускаем объявление (будет показано как "Нейросеть недоступна")
                     if seller.gemini_error:
-                        logger.debug(f"⚠️ Seller {seller.merchant_name} - ошибка проверки, пропускаем")
+                        logger.debug(f"⚠️ Seller {seller.merchant_name} - ошибка Gemini, пропускаем")
                         continue
                     if not seller.third_party_ready:
                         logger.debug(f"❌ Seller {seller.merchant_name} не готов к 3-им лицам - пропускаем")
@@ -726,12 +732,12 @@ class P2PArbitrageBot:
         for buyer in buyers:
             passes, _ = self._check_offer_conditions(buyer, user_filters)
             if passes:
-                if check_enabled and gemini_client:
+                if gemini_enabled and gemini_client:
                     if not buyer.third_party_analyzed:
-                        logger.debug(f"⏳ Buyer {buyer.merchant_name} еще не проанализирован - пропускаем")
+                        logger.debug(f"⏳ Buyer {buyer.merchant_name} еще не проанализирован Gemini - пропускаем")
                         continue
                     if buyer.gemini_error:
-                        logger.debug(f"⚠️ Buyer {buyer.merchant_name} - ошибка проверки, пропускаем")
+                        logger.debug(f"⚠️ Buyer {buyer.merchant_name} - ошибка Gemini, пропускаем")
                         continue
                     if not buyer.third_party_ready:
                         logger.debug(f"❌ Buyer {buyer.merchant_name} не готов к 3-им лицам - пропускаем")
@@ -927,18 +933,21 @@ class P2PArbitrageBot:
         logger.info(f"   SELLER (merchant: {signal.seller.merchant_name}, ID: {signal.seller.item_id}) REMARK: {signal.seller.remark[:300]}...")
         logger.info(f"   BUYER (merchant: {signal.buyer.merchant_name}, ID: {signal.buyer.item_id}) REMARK: {signal.buyer.remark[:300]}...")
         
+        # Формируем сообщение
         message_lines = ["🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥", ""]
         
+        # Продавец
         message_lines.append("🟢 ПРОДАВЕЦ (SELLER)")
         message_lines.append(f"• Курс: {signal.seller.price:.2f}₽")
         message_lines.append(f"• Лимиты: {format_number(signal.seller.min_amount)} - {format_number(signal.seller.max_amount)}₽")
         message_lines.append(f"• Мерчант: {signal.seller.merchant_name}")
         
-        check_enabled = gemini_enabled_for_user.get(user_id, False)
+        # Проверяем статус Gemini для продавца
+        gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         
-        if check_enabled and gemini_client:
+        if gemini_enabled and gemini_client:
             if signal.seller.gemini_error:
-                message_lines.append("• 🤖 Проверка временно недоступна")
+                message_lines.append("• 🤖 Нейросеть временно недоступна")
             else:
                 status = "✅ Готов" if signal.seller.third_party_ready else "❌ Не готов"
                 message_lines.append(f"• Платежи от 3-их лиц: {status}")
@@ -946,14 +955,15 @@ class P2PArbitrageBot:
         message_lines.append(f"• Ссылка на профиль: {seller_profile_url}")
         message_lines.append("")
         
+        # Покупатель
         message_lines.append("🔴 ПОКУПАТЕЛЬ (BUYER)")
         message_lines.append(f"• Курс: {signal.buyer.price:.2f}₽")
         message_lines.append(f"• Лимиты: {format_number(signal.buyer.min_amount)} - {format_number(signal.buyer.max_amount)}₽")
         message_lines.append(f"• Мерчант: {signal.buyer.merchant_name}")
         
-        if check_enabled and gemini_client:
+        if gemini_enabled and gemini_client:
             if signal.buyer.gemini_error:
-                message_lines.append("• 🤖 Проверка временно недоступна")
+                message_lines.append("• 🤖 Нейросеть временно недоступна")
             else:
                 status = "✅ Готов" if signal.buyer.third_party_ready else "❌ Не готов"
                 message_lines.append(f"• Платежи от 3-их лиц: {status}")
@@ -961,6 +971,7 @@ class P2PArbitrageBot:
         message_lines.append(f"• Ссылка на профиль: {buyer_profile_url}")
         message_lines.append("")
         
+        # Расчет прибыли
         message_lines.append("📊 РАСЧЕТ ПРИБЫЛИ")
         message_lines.append(f"• Спред: {signal.spread:.2f}%")
         message_lines.append(f"• Прибыль с 1 USDT: {signal.profit:.2f}₽")
@@ -983,20 +994,21 @@ class P2PArbitrageBot:
     async def get_filter_settings(self, user_id: int) -> str:
         filters = user_filters.get(user_id, {})
         delay = user_signal_delay.get(user_id, 4)
-        check_enabled = gemini_enabled_for_user.get(user_id, False)
+        gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         cache_size = len(gemini_cache)
         
-        check_status = "✅ Включена" if check_enabled else "❌ Выключена"
+        # Проверяем статус Gemini
+        gemini_status = "❌ Недоступен"
         if gemini_client and gemini_available:
-            check_status = "✅ Активна"
+            gemini_status = "✅ Доступен"
         elif gemini_client and not gemini_available:
-            check_status = "⚠️ Временно недоступна"
+            gemini_status = "⚠️ Ошибка (проверьте модель)"
         
         if not filters:
-            return f"🔧 Фильтры не настроены. Используйте /help для настройки.\n\n⏱ Задержка между сигналами: {delay}с\n🤖 Проверка условий: {check_status}\n💾 Память: {cache_size} записей"
+            return f"🔧 Фильтры не настроены. Используйте /help для настройки.\n\n⏱ Задержка между сигналами: {delay}с\n🤖 Gemini: {'✅ Включен' if gemini_enabled else '❌ Выключен'} ({gemini_status})\n💾 Кэш: {cache_size} записей"
         
         settings = []
-        settings.append("📋 <b>Текущие настройки:</b>")
+        settings.append("📋 <b>Текущие настройки фильтров:</b>")
         settings.append("")
         
         if filters.get("exact_amount"):
@@ -1008,12 +1020,12 @@ class P2PArbitrageBot:
         if filters.get("min_spread"):
             settings.append(f"• Мин. спред: {filters['min_spread']}%")
         if filters.get("blacklist"):
-            settings.append(f"• Черный список: {', '.join(filters['blacklist'])}")
+            settings.append(f"• Черный список (ники мерчантов): {', '.join(filters['blacklist'])}")
         
         settings.append("")
         settings.append(f"⏱ <b>Задержка между сигналами:</b> {delay}с")
-        settings.append(f"🤖 <b>Проверка условий:</b> {check_status}")
-        settings.append(f"💾 <b>Память:</b> {cache_size} записей")
+        settings.append(f"🤖 <b>Gemini (3-и лица):</b> {'✅ Включен' if gemini_enabled else '❌ Выключен'} ({gemini_status})")
+        settings.append(f"💾 <b>Кэш Gemini:</b> {cache_size} записей")
         
         if len(settings) == 3:
             settings.append("⚠️ Фильтры настроены, но неактивны (запустите /start_monitoring)")
@@ -1023,14 +1035,14 @@ class P2PArbitrageBot:
 
 async def set_bot_commands(bot: Bot):
     commands = [
-        BotCommand(command="settings", description="📋 Показать текущие настройки"),
-        BotCommand(command="status", description="📊 Статус работы"),
-        BotCommand(command="start_monitoring", description="▶️ Запустить мониторинг"),
+        BotCommand(command="settings", description="📋 Показать текущие настройки фильтров"),
+        BotCommand(command="status", description="📊 Статус мониторинга"),
+        BotCommand(command="start_monitoring", description="▶️ Запустить мониторинг арбитража"),
         BotCommand(command="stop_monitoring", description="⏹ Остановить мониторинг"),
         BotCommand(command="delay", description="⏱ Установить задержку между сигналами (сек)"),
         BotCommand(command="clear_filters", description="🧹 Очистить все фильтры"),
-        BotCommand(command="check_on", description="🤖 Включить проверку платежей от 3-их лиц"),
-        BotCommand(command="check_off", description="🤖 Выключить проверку платежей от 3-их лиц"),
+        BotCommand(command="gemini_on", description="🤖 Включить анализ 3-их лиц (Gemini)"),
+        BotCommand(command="gemini_off", description="🤖 Выключить анализ 3-их лиц (Gemini)"),
         BotCommand(command="help", description="❓ Настройка фильтров"),
     ]
     await bot.set_my_commands(commands)
@@ -1048,25 +1060,25 @@ async def cmd_start(message: Message):
     welcome_text = """
 🚀 Добро пожаловать в P2P Арбитраж Бот!
 
-Я ищу выгодные арбитражные связки на Bybit P2P и присылаю тебе сигналы.
+Я ищу арбитражные связки на Bybit P2P и присылаю тебе сигналы.
 
 <b>Доступные команды:</b>
 /help - Настройка фильтров
-/settings - Текущие настройки
-/status - Статус работы
+/settings - Текущие настройки фильтров
+/status - Статус мониторинга
 /start_monitoring - Запустить мониторинг
 /stop_monitoring - Остановить мониторинг
 /delay - Установить задержку между сигналами
 /clear_filters - Очистить все фильтры
-/check_on - Включить проверку условий мерчантов
-/check_off - Выключить проверку условий мерчантов
+/gemini_on - Включить анализ 3-их лиц (проверка remark через AI)
+/gemini_off - Выключить анализ 3-их лиц
 
 <b>Как это работает:</b>
 1. Настрой фильтры через /help
 2. Запусти мониторинг /start_monitoring
 3. Бот будет искать выгодные связки
 4. При найденной связке получишь сигнал со ссылками на профили
-5. Если включена проверка - бот будет исключать мерчантов, которые не принимают платежи от 3-их лиц
+5. Если включен Gemini - бот будет проверять готовность к платежам от 3-их лиц
     """
     await safe_send_message(message, welcome_text)
     
@@ -1080,7 +1092,7 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     help_text = """
-📖 <b>Помощь по настройке</b>
+📖 <b>Помощь по фильтрам</b>
 
 <b>Что можно настраивать:</b>
 
@@ -1090,24 +1102,25 @@ async def cmd_help(message: Message):
    /set_max 30000 - максимум 30 000 ₽
 
 2. <b>Черный список (исключаем по никам мерчантов)</b>
-   /add_blacklist "Имя Мерчанта" - НЕ показывать этого мерчанта
-   /add_blacklist Мошенник - НЕ показывать мерчантов с этим словом в нике
+   /add_blacklist "Имя Мерчанта" - НЕ показывать объявления этого мерчанта
+   /add_blacklist Мошенник - НЕ показывать объявления мерчантов с этим словом в нике
    /remove_blacklist "Имя Мерчанта" - убрать из черного списка
    
    <b>⚠️ ВАЖНО:</b> Черный список работает ТОЛЬКО с никами мерчантов!
    • Bybit API НЕ передает текстовые условия/описания объявлений
-   • Черный список НЕ может фильтровать по описанию или условиям
+   • Черный список НЕ может фильтровать по описанию или условиям мейкера
    • Если хотите исключить мерчанта - добавьте его полный ник или часть ника
 
-3. <b>Минимальный спред</b>
+3. <b>Спред</b>
    /set_spread 0.5 - минимальный спред 0.5%
 
 4. <b>Задержка между сигналами</b>
-   /delay 5 - задержка 5 секунд между сигналами
-   /delay 2 - задержка 2 секунды (быстрее)
-   /delay 10 - задержка 10 секунд (медленнее)
+   /delay 5 - установить задержку 5 секунд между отправками сигналов
+   /delay 2 - установить задержку 2 секунды (быстрее)
+   /delay 10 - установить задержку 10 секунд (медленнее)
    
-   <b>⚠️ ВАЖНО:</b> Рекомендуем 3-5 секунд
+   <b>⚠️ ВАЖНО:</b> Если задержка слишком маленькая (1-2с), 
+   вы можете получить много сообщений подряд. Рекомендуем 3-5 секунд.
 
 5. <b>Управление</b>
    /start_monitoring - запуск поиска
@@ -1115,16 +1128,16 @@ async def cmd_help(message: Message):
    /status - текущий статус
    /clear_filters - очистить все фильтры
 
-6. <b>🤖 Проверка условий мерчантов</b>
-   /check_on - Включить проверку
-   /check_off - Выключить проверку
+6. <b>🤖 Gemini (анализ 3-их лиц)</b>
+   /gemini_on - Включить анализ remark через AI
+   /gemini_off - Выключить анализ remark через AI
    
    <b>Как работает:</b>
-   • Бот анализирует текст объявления
+   • Gemini анализирует текст объявления (remark)
    • Определяет, готов ли мерчант принимать платежи от 3-их лиц
    • Если в тексте нет явного запрета - считается, что готов
    • В сигнале будет указан статус для продавца и покупателя
-   • По умолчанию проверка ВЫКЛЮЧЕНА
+   • По умолчанию Gemini ВЫКЛЮЧЕН (нужно включить командой)
 
 <b>Важно про кавычки!</b>
 Если имя мерчанта состоит из нескольких слов, заключите его в кавычки:
@@ -1138,14 +1151,14 @@ async def cmd_help(message: Message):
 4. /delay 5
 5. /add_blacklist "Мошенник Иван"
 6. /add_blacklist "ALL FOR ALL"
-7. /check_on  # Включить проверку
+7. /gemini_on  # Включить анализ 3-их лиц
 8. /start_monitoring
 
 <b>Как работает черный список:</b>
 • Проверяет только НИК мерчанта
 • Регистр не важен
 • Можно добавить как полное имя, так и часть
-• Пример: /add_blacklist "Мошенник" - исключит всех мерчантов с этим словом
+• Пример: /add_blacklist "Мошенник" - исключит всех мерчантов с этим словом в нике
 • Пример: /add_blacklist "ALL FOR ALL" - исключит только этого конкретного мерчанта
     """
     await safe_send_message(message, help_text)
@@ -1160,14 +1173,14 @@ async def cmd_status(message: Message):
     user_id = message.from_user.id
     is_active = user_subscriptions.get(user_id, False)
     status_emoji = "🟢" if is_active else "🔴"
-    status_text = "Работает" if is_active else "Остановлен"
+    status_text = "Активен" if is_active else "Остановлен"
     
     settings_preview = await arbitrage_bot.get_filter_settings(user_id)
     
     signals_count = len(sent_signals.get(user_id, {}))
     
     status_message = f"""
-<b>Статус:</b> {status_emoji} {status_text}
+<b>Статус мониторинга:</b> {status_emoji} {status_text}
 <b>Отправлено сигналов:</b> {signals_count}
 
 {settings_preview}
@@ -1191,14 +1204,14 @@ async def cmd_start_monitoring(message: Message):
     user_subscriptions[user_id] = True
     
     delay = user_signal_delay.get(user_id, 4)
-    check_enabled = gemini_enabled_for_user.get(user_id, False)
+    gemini_enabled = gemini_enabled_for_user.get(user_id, False)
     
     await safe_send_message(
         message,
         f"✅ Мониторинг запущен!\n"
         f"Бот будет присылать сигналы при нахождении выгодных связок.\n"
         f"⏱ Задержка между сигналами: {delay}с\n"
-        f"🤖 Проверка условий: {'Включена' if check_enabled else 'Выключена'}\n"
+        f"🤖 Gemini: {'Включен (проверка 3-их лиц)' if gemini_enabled else 'Выключен'}\n"
         f"Для остановки используйте: /stop_monitoring"
     )
 
@@ -1269,26 +1282,28 @@ async def cmd_clear_filters(message: Message):
     user_filters[user_id] = {}
     user_subscriptions[user_id] = False
     sent_signals[user_id] = {}
-    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен. Задержка и проверка сохранены.")
+    await safe_send_message(message, "🧹 Все фильтры очищены. Мониторинг остановлен. Задержка и Gemini сохранены.")
 
-@dp.message(Command("check_on"))
-async def cmd_check_on(message: Message):
+@dp.message(Command("gemini_on"))
+async def cmd_gemini_on(message: Message):
     user_id = message.from_user.id
     
     if not gemini_client:
         await safe_send_message(
             message,
-            "❌ Функция проверки недоступна. Обратитесь к администратору."
+            "❌ Gemini недоступен! Проверьте API ключ в настройках бота."
         )
         return
     
+    # Проверяем доступность модели
     await check_gemini_availability()
     
     if not gemini_available:
         await safe_send_message(
             message,
-            "⚠️ Проверка включена, но временно недоступна.\n"
-            "Попробуйте позже."
+            "⚠️ Gemini включен, но модель недоступна!\n"
+            "Проверьте название модели в настройках бота.\n"
+            "Попробуйте использовать: gemini-3.5-flash-lite"
         )
         return
     
@@ -1299,23 +1314,25 @@ async def cmd_check_on(message: Message):
     
     await safe_send_message(
         message,
-        "🤖 Проверка условий ВКЛЮЧЕНА!\n\n"
-        "Теперь бот будет проверять, готов ли мерчант принимать платежи от 3-их лиц.\n"
-        "Если мерчант НЕ готов - его объявление будет исключено из сигналов.\n\n"
-        "Для отключения используйте: /check_off"
+        "🤖 Gemini ВКЛЮЧЕН!\n\n"
+        "Теперь бот будет анализировать текст объявлений (remark) через AI.\n"
+        "Это позволит определить, готов ли мерчант принимать платежи от 3-их лиц.\n\n"
+        "⚠️ Если мерчант НЕ готов к платежам от 3-их лиц - его объявление будет исключено из сигналов.\n"
+        "Если в тексте нет упоминаний о 3-их лицах - считается, что мерчант готов.\n\n"
+        "Для отключения используйте: /gemini_off"
     )
 
-@dp.message(Command("check_off"))
-async def cmd_check_off(message: Message):
+@dp.message(Command("gemini_off"))
+async def cmd_gemini_off(message: Message):
     user_id = message.from_user.id
     gemini_enabled_for_user[user_id] = False
     
     await safe_send_message(
         message,
-        "🤖 Проверка условий ВЫКЛЮЧЕНА!\n\n"
-        "Теперь бот НЕ будет проверять готовность к платежам от 3-их лиц.\n"
-        "Все объявления будут показываться без дополнительной проверки.\n\n"
-        "Для включения используйте: /check_on"
+        "🤖 Gemini ВЫКЛЮЧЕН!\n\n"
+        "Теперь бот НЕ будет анализировать текст объявлений через AI.\n"
+        "Все объявления будут показываться без фильтрации по готовности к платежам от 3-их лиц.\n\n"
+        "Для включения используйте: /gemini_on"
     )
 
 # --- Команды для настройки фильтров ---
@@ -1493,3 +1510,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
