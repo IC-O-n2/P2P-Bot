@@ -45,7 +45,7 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 # Инициализация Gemini (если есть ключ)
 gemini_client = None
 gemini_enabled_for_user: Dict[int, bool] = {}
-gemini_available = True  # Флаг доступности Gemini
+gemini_available = True
 
 if GEMINI_API_KEY:
     try:
@@ -148,7 +148,7 @@ async def wait_for_gemini_quota():
             logger.warning(f"⏳ Достигнут лимит Gemini ({GEMINI_MAX_REQUESTS_PER_MINUTE}/мин), ждем {wait_seconds}с")
             await asyncio.sleep(wait_seconds)
 
-# Функция проверки доступности Gemini
+# Функция проверки доступности Gemini (только при старте и при ошибках)
 async def check_gemini_availability():
     """Проверяет, доступна ли модель Gemini"""
     global gemini_available
@@ -158,7 +158,6 @@ async def check_gemini_availability():
         return False
     
     try:
-        # Пробный запрос к Gemini
         test_prompt = "Ответь только: ok"
         
         response = await asyncio.get_event_loop().run_in_executor(
@@ -181,6 +180,8 @@ async def check_gemini_availability():
         error_msg = str(e)
         if "404" in error_msg or "NOT_FOUND" in error_msg:
             logger.error(f"❌ Модель Gemini недоступна (404). Проверьте название модели.")
+        elif "429" in error_msg:
+            logger.error(f"❌ Превышен лимит Gemini (429). Квота будет восстановлена позже.")
         else:
             logger.error(f"❌ Ошибка проверки Gemini: {error_msg[:100]}")
         
@@ -250,17 +251,21 @@ async def analyze_single_with_gemini(remark: str, merchant_name: str, item_id: s
     try:
         logger.info(f"📤 Отправка запроса в Gemini для {merchant_name} (ID: {item_id})")
         
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: gemini_client.models.generate_content(
-                model='gemini-3.5-flash-lite',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    top_p=0.8,
-                    max_output_tokens=50,
+        # Таймаут 15 секунд
+        response = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: gemini_client.models.generate_content(
+                    model='gemini-3.5-flash-lite',
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        top_p=0.8,
+                        max_output_tokens=50,
+                    )
                 )
-            )
+            ),
+            timeout=15.0
         )
         
         gemini_request_timestamps.append(datetime.now())
@@ -286,14 +291,24 @@ async def analyze_single_with_gemini(remark: str, merchant_name: str, item_id: s
         
         return result
         
+    except asyncio.TimeoutError:
+        logger.error(f"⏰ Таймаут Gemini для {merchant_name} (ID: {item_id}) - запрос завис на 15+ секунд")
+        # Не помечаем как недоступный, возможно временная проблема
+        result = {"ready": True, "analyzed": True, "gemini_error": True}
+        gemini_cache[cache_key] = result
+        gemini_cache_ttl[cache_key] = datetime.now()
+        return result
+        
     except Exception as e:
         error_msg = str(e)
         logger.error(f"❌ Ошибка Gemini для {merchant_name}: {error_msg[:100]}")
         
-        # Проверяем, не недоступна ли модель
         if "404" in error_msg or "NOT_FOUND" in error_msg:
             gemini_available = False
             logger.error("🚨 Модель Gemini недоступна! Все последующие запросы будут пропущены.")
+        elif "429" in error_msg:
+            logger.warning("⚠️ Превышен лимит Gemini. Ждем восстановления квоты...")
+            # Не помечаем как недоступный, просто ждем
         
         result = {"ready": True, "analyzed": True, "gemini_error": True}
         gemini_cache[cache_key] = result
@@ -318,7 +333,7 @@ class P2POffer:
     remark: str = ""
     third_party_ready: bool = True
     third_party_analyzed: bool = False
-    gemini_error: bool = False  # Флаг ошибки Gemini
+    gemini_error: bool = False
     token: str = "USDT"
     fiat: str = "RUB"
 
@@ -466,6 +481,7 @@ class P2PArbitrageBot:
         self.bybit_client = None
         self._stop_requested = False
         self._gemini_check_task: Optional[asyncio.Task] = None
+        self._last_gemini_check: Optional[datetime] = None
         
         if BYBIT_API_KEY and BYBIT_API_SECRET:
             self.bybit_client = BybitP2PClient(BYBIT_API_KEY, BYBIT_API_SECRET)
@@ -478,8 +494,11 @@ class P2PArbitrageBot:
         self._stop_requested = False
         self.monitor_task = asyncio.create_task(self._monitor_loop())
         
-        # Запускаем проверку Gemini при старте
+        # Проверяем Gemini при старте
         if gemini_client:
+            await check_gemini_availability()
+            self._last_gemini_check = datetime.now()
+            # Запускаем периодическую проверку (раз в 2 часа)
             self._gemini_check_task = asyncio.create_task(self._periodic_gemini_check())
         
         logger.info("Бот успешно запущен")
@@ -505,11 +524,21 @@ class P2PArbitrageBot:
         logger.info("Бот остановлен")
     
     async def _periodic_gemini_check(self):
-        """Периодическая проверка доступности Gemini"""
+        """Периодическая проверка доступности Gemini - 1 раз в 2 часа"""
         while self.is_running and not self._stop_requested:
-            await asyncio.sleep(120)  # Проверяем каждые 2 минуты
+            # Ждем 2 часа между проверками
+            await asyncio.sleep(7200)  # 2 часа = 7200 секунд
+            
+            if not self.is_running or self._stop_requested:
+                break
+            
             if gemini_client:
-                await check_gemini_availability()
+                # Проверяем только если Gemini не доступен или прошло много времени
+                now = datetime.now()
+                if not gemini_available or (self._last_gemini_check and (now - self._last_gemini_check).seconds > 7200):
+                    logger.info("🔄 Периодическая проверка Gemini (раз в 2 часа)")
+                    await check_gemini_availability()
+                    self._last_gemini_check = now
     
     async def stop_for_user(self, user_id: int):
         user_subscriptions[user_id] = False
@@ -719,7 +748,6 @@ class P2PArbitrageBot:
                     if not seller.third_party_analyzed:
                         logger.debug(f"⏳ Seller {seller.merchant_name} еще не проанализирован Gemini - пропускаем")
                         continue
-                    # Если есть ошибка Gemini, пропускаем объявление (будет показано как "Нейросеть недоступна")
                     if seller.gemini_error:
                         logger.debug(f"⚠️ Seller {seller.merchant_name} - ошибка Gemini, пропускаем")
                         continue
@@ -933,7 +961,8 @@ class P2PArbitrageBot:
         logger.info(f"   SELLER (merchant: {signal.seller.merchant_name}, ID: {signal.seller.item_id}) REMARK: {signal.seller.remark[:300]}...")
         logger.info(f"   BUYER (merchant: {signal.buyer.merchant_name}, ID: {signal.buyer.item_id}) REMARK: {signal.buyer.remark[:300]}...")
         
-        # Формируем сообщение
+        gemini_enabled = gemini_enabled_for_user.get(user_id, False)
+        
         message_lines = ["🔥 АРБИТРАЖНЫЙ СИГНАЛ 🔥", ""]
         
         # Продавец
@@ -941,9 +970,6 @@ class P2PArbitrageBot:
         message_lines.append(f"• Курс: {signal.seller.price:.2f}₽")
         message_lines.append(f"• Лимиты: {format_number(signal.seller.min_amount)} - {format_number(signal.seller.max_amount)}₽")
         message_lines.append(f"• Мерчант: {signal.seller.merchant_name}")
-        
-        # Проверяем статус Gemini для продавца
-        gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         
         if gemini_enabled and gemini_client:
             if signal.seller.gemini_error:
@@ -997,7 +1023,6 @@ class P2PArbitrageBot:
         gemini_enabled = gemini_enabled_for_user.get(user_id, False)
         cache_size = len(gemini_cache)
         
-        # Проверяем статус Gemini
         gemini_status = "❌ Недоступен"
         if gemini_client and gemini_available:
             gemini_status = "✅ Доступен"
@@ -1510,4 +1535,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
