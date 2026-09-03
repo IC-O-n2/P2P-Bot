@@ -258,11 +258,11 @@ async def analyze_batch_with_gemini(offers: List[Tuple[str, str, str]]) -> Dict[
                     config=types.GenerateContentConfig(
                         temperature=0.0,
                         top_p=0.8,
-                        max_output_tokens=800,
+                        max_output_tokens=1200,  # Увеличено для батча из 20 объявлений
                     )
                 )
             ),
-            timeout=20.0
+            timeout=25.0  # Больше времени на 20 объявлений
         )
         
         gemini_request_timestamps.append(datetime.now())
@@ -292,7 +292,7 @@ async def analyze_batch_with_gemini(offers: List[Tuple[str, str, str]]) -> Dict[
             return {}
             
     except asyncio.TimeoutError:
-        logger.error(f"⏰ Таймаут батч-запроса Gemini")
+        logger.error(f"⏰ Таймаут батч-запроса Gemini (25 сек)")
         return {}
     except Exception as e:
         logger.error(f"❌ Ошибка батч-анализа Gemini: {e}")
@@ -574,7 +574,7 @@ class P2PArbitrageBot:
         return f"https://www.bybit.com/ru-RU/p2p/profile/{user_mask_id}/USDT/RUB/item"
     
     async def _analyze_offers_with_gemini(self, sellers: List[P2POffer], buyers: List[P2POffer], user_id: int) -> Tuple[List[P2POffer], List[P2POffer]]:
-        """Анализирует объявления через Gemini с батчингом"""
+        """Анализирует объявления через Gemini с батчингом (20 объявлений за запрос)"""
         global gemini_available
         
         gemini_enabled = gemini_enabled_for_user.get(user_id, False)
@@ -607,9 +607,9 @@ class P2PArbitrageBot:
         potential_sellers.sort(key=lambda x: x.price)
         potential_buyers.sort(key=lambda x: x.price, reverse=True)
         
-        # Берем больше объявлений для батчинга
-        top_sellers = potential_sellers[:20]
-        top_buyers = potential_buyers[:20]
+        # Берем больше объявлений для батчинга (40 с каждой стороны)
+        top_sellers = potential_sellers[:30]
+        top_buyers = potential_buyers[:30]
         
         # Собираем объявления для анализа
         offers_to_analyze = []
@@ -640,9 +640,9 @@ class P2PArbitrageBot:
             if buyer.remark and buyer.remark.strip():
                 offers_to_analyze.append(buyer)
         
-        # Батчинг: отправляем по 10 объявлений за запрос
-        BATCH_SIZE = 10
-        MAX_BATCHES_PER_CYCLE = 3  # Максимум 3 батча за цикл (30 объявлений)
+        # Батчинг: отправляем по 20 объявлений за запрос
+        BATCH_SIZE = 20
+        MAX_BATCHES_PER_CYCLE = 2  # Максимум 2 батча за цикл (40 объявлений)
         
         if offers_to_analyze:
             # Сортируем по приоритету
@@ -664,7 +664,7 @@ class P2PArbitrageBot:
                 sorted_offers = sorted_offers[:max_offers]
                 logger.info(f"📊 Взято {len(sorted_offers)} объявлений из {len(offers_to_analyze)} для батчинга")
             
-            # Разбиваем на батчи
+            # Разбиваем на батчи по 20
             for i in range(0, len(sorted_offers), BATCH_SIZE):
                 batch = sorted_offers[i:i+BATCH_SIZE]
                 
@@ -702,7 +702,7 @@ class P2PArbitrageBot:
                 
                 # Задержка между батчами для соблюдения лимитов
                 if i + BATCH_SIZE < len(sorted_offers):
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(2.0)  # Чуть больше задержка для 20 объявлений
         
         # Остальные объявления помечаем как не проанализированные
         for seller in sellers:
@@ -744,7 +744,7 @@ class P2PArbitrageBot:
                     buyer.gemini_error = False
         
         total_batches = (len(offers_to_analyze) + BATCH_SIZE - 1) // BATCH_SIZE if offers_to_analyze else 0
-        logger.info(f"✅ Проанализировано Gemini (батчинг): {len(offers_to_analyze)} объявлений за {total_batches} запросов, всего в кэше: {len(gemini_cache)}")
+        logger.info(f"✅ Проанализировано Gemini (батчинг 20): {len(offers_to_analyze)} объявлений за {total_batches} запросов, всего в кэше: {len(gemini_cache)}")
         
         return sellers, buyers
     
