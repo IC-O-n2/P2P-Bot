@@ -253,7 +253,7 @@ async def analyze_batch_with_gemini(offers: List[Tuple[str, str, str]]) -> Dict[
             asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: gemini_client.models.generate_content(
-                    model='gemini-3.1-flash-lite',
+                    model='gemini-3.7-flash',
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.0,
